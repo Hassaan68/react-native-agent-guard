@@ -1,9 +1,5 @@
 # react-native-agent-guard
 
-# react-native-agent-guard
-
-# react-native-agent-guard
-
 [![npm version](https://img.shields.io/npm/v/react-native-agent-guard.svg?style=flat-square)](https://www.npmjs.com/package/react-native-agent-guard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](./LICENSE)
 [![CI Status](https://img.shields.io/github/actions/workflow/status/Hassaan68/react-native-agent-guard/ci.yml?branch=main&style=flat-square&label=tests)](https://github.com/Hassaan68/react-native-agent-guard/actions/workflows/ci.yml)
