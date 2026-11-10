@@ -1,8 +1,12 @@
 # react-native-agent-guard
 
+# react-native-agent-guard
+
+# react-native-agent-guard
+
 [![npm version](https://img.shields.io/npm/v/react-native-agent-guard.svg?style=flat-square)](https://www.npmjs.com/package/react-native-agent-guard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](./LICENSE)
-[![CI Status](https://img.shields.io/github/actions/workflow/status/muhammadhassaan/react-native-agent-guard/ci.yml?branch=main&style=flat-square&label=tests)](./.github/workflows/ci.yml)
+[![CI Status](https://img.shields.io/github/actions/workflow/status/Hassaan68/react-native-agent-guard/ci.yml?branch=main&style=flat-square&label=tests)](https://github.com/Hassaan68/react-native-agent-guard/actions/workflows/ci.yml)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178C6.svg?style=flat-square&logo=typescript&logoColor=white)](./tsconfig.json)
 
 **Zero-dependency permission, policy, validation, and human-in-the-loop guardrails for autonomous AI agents in React Native.**
