@@ -1,4 +1,0 @@
-verifyDepsBeforeRun: false
-minimumReleaseAge: 0
-onlyBuiltDependencies:
-  - esbuild
