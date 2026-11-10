@@ -1,0 +1,62 @@
+name: Feature Request
+description: Suggest a new guardrail capability, mobile tool preset, schema exporter, or UI enhancement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea to make autonomous AI agents safer or easier to build in React Native? Tell us about your use case below!
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Feature Category
+      description: Which area of `react-native-agent-guard` does this proposal relate to?
+      options:
+        - Core Registry & Policy Engine
+        - Human-in-the-Loop UI (<AgentApprovalProvider> / <AgentApprovalSheet>)
+        - Biometric & Hardware Authentication
+        - Built-In Mobile Tool Presets (BLE, Payments, Calendar, Location, Contacts, etc.)
+        - Schema Exporters (OpenAI, Claude, MCP, Gemini, etc.)
+        - Audit Logging & Telemetry
+        - Developer Experience & TypeScript Types
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement / Mobile Agent Use Case
+      description: What problem or safety gap are you trying to solve in your React Native agent application?
+      placeholder: "When building a voice/chat agent that accesses device contacts, I need..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution / API Design
+      description: Describe how you would like the API, hook, or preset to look and behave.
+      placeholder: |
+        const contactsPreset = createContactsToolPreset({
+          policy: 'confirm',
+        });
+      render: tsx
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Have you considered any workarounds or alternative approaches (e.g., custom policy functions or wrapper hooks)?
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I would be willing to submit a Pull Request to implement this feature.

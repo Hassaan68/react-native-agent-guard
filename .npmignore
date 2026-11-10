@@ -10,6 +10,8 @@ tsup.config.ts
 jest.config.cjs
 .gitignore
 .npmignore
+pnpm-workspace.yaml
+pnpm-lock.yaml
 CONTRIBUTING.md
 
 # Logs, coverage & local artifacts
