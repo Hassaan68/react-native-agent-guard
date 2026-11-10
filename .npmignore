@@ -1,0 +1,19 @@
+# Source & tests
+src/
+__tests__/
+__mocks__/
+
+# Config & CI
+.github/
+tsconfig.json
+tsup.config.ts
+jest.config.cjs
+.gitignore
+.npmignore
+CONTRIBUTING.md
+
+# Logs, coverage & local artifacts
+coverage/
+*.log
+.DS_Store
+*.tgz
