@@ -1,6 +1,6 @@
 {
   "name": "react-native-agent-guard",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Zero-dependency permission, policy, validation, and human-in-the-loop guardrails for AI agents in React Native.",
   "author": {
     "name": "Muhammad Hassaan",
@@ -34,9 +34,7 @@
       "require": {
         "types": "./dist/index.d.ts",
         "default": "./dist/index.js"
-      },
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
+      }
     },
     "./package.json": "./package.json"
   },
@@ -87,5 +85,6 @@
     "biometrics",
     "security",
     "typescript"
-  ]
+  ],
+  "packageManager": "pnpm@9.15.0"
 }

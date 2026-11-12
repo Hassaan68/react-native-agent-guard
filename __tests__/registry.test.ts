@@ -5,9 +5,11 @@ import {
   AgentApprovalSheet,
   createBleSyncToolPreset,
   createCalendarEventToolPreset,
+  createGuardrails,
   createPaymentToolPreset,
   createToolRegistry,
   type AuditStorageAdapter,
+  type GuardrailConfig,
 } from '../src';
 
 describe('react-native-agent-guard — ToolRegistry & Presets', () => {
@@ -440,6 +442,61 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
         { registry, children: React.createElement(AgentApprovalSheet) },
       );
       expect(element).toBeDefined();
+    });
+  });
+
+  describe('8. createGuardrails & GuardrailConfig permission checks', () => {
+    it('applies custom defaultPolicy, per-tool permissions, blockedTools, and checkToolPermission', async () => {
+      const config: GuardrailConfig = {
+        defaultPolicy: 'confirm',
+        permissions: {
+          read_status: 'auto',
+        },
+        blockedTools: ['dangerous_reset'],
+        onApprovalRequired: async () => true,
+      };
+
+      const guardrails = createGuardrails(config);
+
+      guardrails
+        .register('read_status', {
+          description: 'Read device status',
+          inputSchema: z.object({}),
+          handler: () => ({ ok: true }),
+        })
+        .register('write_setting', {
+          description: 'Modify device setting (inherits defaultPolicy confirm)',
+          inputSchema: z.object({ key: z.string() }),
+          handler: ({ key }) => ({ updated: key }),
+        })
+        .register('dangerous_reset', {
+          description: 'Blocked tool',
+          inputSchema: z.object({}),
+          policy: 'auto',
+          handler: () => ({ reset: true }),
+        });
+
+      expect(await guardrails.checkToolPermission('read_status')).toBe('auto');
+      expect(await guardrails.checkToolPermission('write_setting')).toBe(
+        'confirm',
+      );
+      expect(await guardrails.checkToolPermission('dangerous_reset')).toBe(
+        'deny',
+      );
+
+      const readRes = await guardrails.execute('read_status', {});
+      expect(readRes.success).toBe(true);
+      expect(readRes.policy).toBe('auto');
+
+      const writeRes = await guardrails.execute('write_setting', {
+        key: 'theme',
+      });
+      expect(writeRes.success).toBe(true);
+      expect(writeRes.policy).toBe('confirm');
+
+      const blockedRes = await guardrails.execute('dangerous_reset', {});
+      expect(blockedRes.success).toBe(false);
+      expect(blockedRes.code).toBe('DENIED_BY_POLICY');
     });
   });
 });

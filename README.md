@@ -63,9 +63,48 @@ yarn add react-native-agent-guard zod
 
 ---
 
-## Quickstart
+## Quick Start
 
-### 1. Create a Tool Registry & Define Policies
+### 1. Configure Guardrails (`createGuardrails`)
+
+Use `createGuardrails()` to configure a `defaultPolicy`, per-tool `permissions`, `blockedTools`, and a custom `checkPermission` hook:
+
+```ts
+import { z } from 'zod';
+import { createGuardrails } from 'react-native-agent-guard';
+
+export const guardrails = createGuardrails({
+  defaultPolicy: 'confirm',
+  blockedTools: ['wipe_device_storage'],
+  permissions: {
+    get_battery_level: 'auto',
+  },
+  // Custom permission check evaluated before tool execution
+  checkPermission: async (toolName, parsedInput) => {
+    if (
+      toolName === 'send_payment' &&
+      typeof parsedInput === 'object' &&
+      parsedInput !== null &&
+      'amount' in parsedInput
+    ) {
+      const amount = Number((parsedInput as { amount: number }).amount);
+      if (amount > 1000) return 'deny';
+      if (amount > 100) return 'biometric';
+      if (amount > 25) return 'confirm';
+      return 'auto';
+    }
+    return true; // Fall back to per-tool policy or defaultPolicy ('confirm')
+  },
+});
+
+// Inspect effective policy for any tool & input before execution
+const policy = await guardrails.checkToolPermission('send_payment', {
+  recipient: 'alice@example.com',
+  amount: 250,
+}); // -> 'biometric'
+```
+
+### 2. Register Tools & Connect React Native Approval UI
 
 ```tsx
 import React from 'react';
@@ -73,14 +112,19 @@ import { Button, SafeAreaView } from 'react-native';
 import { z } from 'zod';
 import * as LocalAuthentication from 'expo-local-authentication';
 import {
-  createToolRegistry,
+  createGuardrails,
   AgentApprovalProvider,
   AgentApprovalSheet,
 } from 'react-native-agent-guard';
 
-// 1. Initialize the registry with biometric verification support
-export const registry = createToolRegistry({
+// 1. Initialize guardrails with defaultPolicy, checkPermission, and biometric verification
+export const registry = createGuardrails({
+  defaultPolicy: 'confirm',
   defaultTimeoutMs: 15_000,
+  checkPermission: (toolName, parsedInput) => {
+    if (toolName === 'delete_account_data') return 'confirm';
+    return true;
+  },
   onBiometricRequired: async (request) => {
     const result = await LocalAuthentication.authenticateAsync({
       promptMessage: `Authenticate to run ${request.toolName}`,
