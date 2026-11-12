@@ -1,15 +1,24 @@
 import React from 'react';
 import { StyleSheet, Text, View, TouchableOpacity, Alert, Platform } from 'react-native';
 import { 
-  createToolRegistry, 
+  createGuardrails, 
+  type GuardrailRegistry,
   AgentApprovalProvider, 
   AgentApprovalSheet 
 } from 'react-native-agent-guard';
 import { z } from 'zod';
 
-// 1. Initialize the registry and register a tool with policy: 'confirm'
+// 1. Initialize the GuardrailRegistry using createGuardrails and register a tool with policy: 'confirm'
 // This forces execution to pause and trigger the UI modal automatically.
-const registry = createToolRegistry().register('transfer_funds', {
+const registry: GuardrailRegistry = createGuardrails({
+  defaultPolicy: 'confirm',
+  checkPermission: (toolName) => {
+    if (toolName === 'transfer_funds') {
+      return 'confirm';
+    }
+    return true;
+  },
+}).register('transfer_funds', {
   description: 'Transfer £150 to a saved beneficiary account',
   inputSchema: z.object({
     recipient: z.string(),
@@ -27,12 +36,17 @@ export default function App() {
     console.log('AI Agent is attempting to call tool...');
     
     // Execute the tool call (this returns a Promise that pauses for UI approval)
-    const result = await registry.execute('transfer_funds', {
+    const result = await registry.execute<{
+      success: boolean;
+      txId: string;
+      recipient: string;
+      amountGBP: number;
+    }>('transfer_funds', {
       recipient: 'Sarah Connor',
       amountGBP: 150.0,
     });
 
-    if (result.ok) {
+    if (result.success && result.data) {
       Alert.alert('Success!', `Transaction ID: ${result.data.txId}`);
     } else {
       Alert.alert('Action Blocked', `Result: ${result.code} - ${result.llmFeedback}`);
