@@ -1,4 +1,12 @@
 import { z } from 'zod';
+import {
+  toLangChainTools,
+  toVercelAITools,
+  type LangChainAdapterOptions,
+  type LangChainToolDefinition,
+  type VercelAIAdapterOptions,
+  type VercelAIToolDefinition,
+} from './adapters';
 import { authenticateWithExpoBiometrics } from './biometrics';
 import {
   MCPSSETransportAdapter,
@@ -474,6 +482,28 @@ export class ToolRegistry {
     return Array.from(this.tools.entries()).map(([name, tool]) =>
       zodToMCPSchema(name, tool.description, tool.inputSchema, options),
     );
+  }
+
+  /**
+   * Convert all registered tools into a Vercel AI SDK (`generateText`, `streamText`, `useChat`)
+   * compatible `tools` map whose `.execute()` calls automatically route through this registry's
+   * guardrail policies, biometric authentication, and `<AgentApprovalSheet />`.
+   */
+  public toVercelAITools(
+    options: VercelAIAdapterOptions = {},
+  ): Record<string, VercelAIToolDefinition> {
+    return toVercelAITools(this, options);
+  }
+
+  /**
+   * Convert all registered tools into LangChain.js (`DynamicStructuredTool`, `ToolNode`, `bindTools`)
+   * compatible tool objects whose `.invoke()`, `.call()`, and `.func()` methods automatically route
+   * through this registry's guardrail policies, biometric authentication, and `<AgentApprovalSheet />`.
+   */
+  public toLangChainTools(
+    options: LangChainAdapterOptions = {},
+  ): LangChainToolDefinition[] {
+    return toLangChainTools(this, options);
   }
 
   /**

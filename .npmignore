@@ -7,7 +7,7 @@ __mocks__/
 .github/
 tsconfig.json
 tsup.config.ts
-jest.config.cjs
+jest.config.js
 .gitignore
 .npmignore
 .prettierrc

@@ -26,3 +26,13 @@ export const Appearance = {
 };
 
 export const useColorScheme = (): 'light' | 'dark' => 'light';
+
+export const Platform = {
+  OS: 'ios' as 'ios' | 'android' | 'web',
+  select: <T>(specifics: { ios?: T; android?: T; default?: T }): T | undefined =>
+    specifics.ios ?? specifics.default,
+};
+
+export const Alert = {
+  alert: jest.fn(),
+};

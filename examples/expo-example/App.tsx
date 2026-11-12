@@ -99,6 +99,10 @@ const registry: GuardrailRegistry = createGuardrails({
 export const openAIToolsPayload = registry.toOpenAITools({ strict: true });
 export const claudeToolsPayload = registry.toClaudeTools({ strict: true });
 
+// Export ready-to-use Vercel AI SDK and LangChain.js tool adapters
+export const vercelAITools = registry.toVercelAITools({ unwrapData: true });
+export const langChainTools = registry.toLangChainTools({ unwrapData: true });
+
 export default function App() {
   const colorScheme = useColorScheme();
   const isDark = colorScheme === 'dark';
@@ -258,6 +262,34 @@ export default function App() {
     }
   };
 
+  const handleRunFrameworkAdapterTool = async () => {
+    console.log('Executing tool via Vercel AI SDK & LangChain adapter...');
+
+    // Invoking vercelAITools.transfer_funds.execute() automatically routes through
+    // GuardrailRegistry, pausing for AgentApprovalSheet confirmation and emitting onAudit telemetry!
+    const adapterResult = (await vercelAITools.transfer_funds?.execute({
+      recipient: 'John Connor',
+      amountGBP: 85.0,
+    })) as {
+      success?: boolean;
+      txId?: string;
+      error?: string;
+      llmFeedback?: string;
+    };
+
+    if (adapterResult && adapterResult.txId) {
+      Alert.alert(
+        'Vercel AI Adapter Success!',
+        `Transaction ID: ${adapterResult.txId}`,
+      );
+    } else {
+      Alert.alert(
+        'Adapter Action Blocked',
+        `Code: ${adapterResult?.error} - ${adapterResult?.llmFeedback}`,
+      );
+    }
+  };
+
   return (
     // 2. Wrap your app tree with the AgentApprovalProvider
     <AgentApprovalProvider registry={registry}>
@@ -285,6 +317,13 @@ export default function App() {
           onPress={handleConnectAndRunMCPTool}
         >
           <Text style={styles.buttonText}>Connect MCP SSE & Run Tool</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.button, styles.adapterButton]}
+          onPress={handleRunFrameworkAdapterTool}
+        >
+          <Text style={styles.buttonText}>Run via Vercel AI / LangChain Adapter</Text>
         </TouchableOpacity>
 
         {auditHistory.length > 0 ? (
@@ -365,6 +404,9 @@ const styles = StyleSheet.create({
   },
   mcpButton: {
     backgroundColor: '#0D9488',
+  },
+  adapterButton: {
+    backgroundColor: '#EA580C',
   },
   buttonText: {
     color: '#fff',
