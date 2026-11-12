@@ -59,7 +59,62 @@ npm install react-native-agent-guard zod
 yarn add react-native-agent-guard zod
 ```
 
-> **Peer Dependencies**: Ensure `react` (`>=18.0.0`), `react-native` (`>=0.72.0`), and `zod` (`^4.0.0`) are installed in your React Native project.
+> **Peer Dependencies**: Ensure `react` (`>=18.0.0`), `react-native` (`>=0.72.0`), and `zod` (`^4.0.0`) are installed in your React Native project. For native hardware biometrics (`policy: 'biometric'`), install `expo-local-authentication`.
+
+---
+
+## Biometric Authentication Setup (`policy: 'biometric'`)
+
+When a tool's policy resolves to `'biometric'`, `react-native-agent-guard` automatically triggers a native FaceID / TouchID / Android Biometric prompt via `expo-local-authentication` before executing the tool handler.
+
+### Option A: Expo Projects
+
+1. Install `expo-local-authentication`:
+
+   ```bash
+   npx expo install expo-local-authentication
+   ```
+
+2. Configure the FaceID usage description plugin in your `app.json` / `app.config.js`:
+
+   ```json
+   {
+     "expo": {
+       "plugins": [
+         [
+           "expo-local-authentication",
+           {
+             "faceIDPermission": "Allow $(PRODUCT_NAME) to verify your identity before executing sensitive AI agent actions."
+           }
+         ]
+       ]
+     }
+   }
+   ```
+
+### Option B: Bare React Native CLI Projects
+
+1. Install `expo-local-authentication` (with Expo modules configured via `npx install-expo-modules@latest`):
+
+   ```bash
+   npm install expo-local-authentication
+   cd ios && pod install
+   ```
+
+2. Add native platform permissions:
+
+   - **iOS (`ios/<AppName>/Info.plist`)**:
+     ```xml
+     <key>NSFaceIDUsageDescription</key>
+     <string>Verify your identity before executing sensitive AI agent actions.</string>
+     ```
+   - **Android (`android/app/src/main/AndroidManifest.xml`)**:
+     ```xml
+     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+     <uses-permission android:name="android.permission.USE_FINGERPRINT" />
+     ```
+
+   > **Using `react-native-biometrics` instead**: If your bare React Native project uses `react-native-biometrics` or a custom hardware keychain, pass an `onBiometricRequired` callback to `createGuardrails({ onBiometricRequired: async (req) => { ... } })`.
 
 ---
 

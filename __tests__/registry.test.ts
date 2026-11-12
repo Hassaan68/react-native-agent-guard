@@ -498,5 +498,48 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
       expect(blockedRes.success).toBe(false);
       expect(blockedRes.code).toBe('DENIED_BY_POLICY');
     });
+
+    it('automatically triggers expo-local-authentication prompt when policy is biometric', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const LocalAuthentication = require('expo-local-authentication') as {
+        authenticateAsync: jest.Mock;
+      };
+
+      const guardrails = createGuardrails({
+        biometricOptions: {
+          promptMessage: (req) => `Confirm FaceID for ${req.toolName}`,
+        },
+      }).register('export_private_key', {
+        description: 'Export encrypted wallet private key',
+        inputSchema: z.object({ accountId: z.string() }),
+        policy: 'biometric',
+        handler: ({ accountId }) => ({ exported: true, accountId }),
+      });
+
+      LocalAuthentication.authenticateAsync.mockResolvedValueOnce({
+        success: true,
+      });
+
+      const okRes = await guardrails.execute('export_private_key', {
+        accountId: 'acc_01',
+      });
+      expect(okRes.success).toBe(true);
+      expect(okRes.policy).toBe('biometric');
+      expect(LocalAuthentication.authenticateAsync).toHaveBeenCalledWith(
+        expect.objectContaining({
+          promptMessage: 'Confirm FaceID for export_private_key',
+        }),
+      );
+
+      LocalAuthentication.authenticateAsync.mockResolvedValueOnce({
+        success: false,
+      });
+
+      const failRes = await guardrails.execute('export_private_key', {
+        accountId: 'acc_01',
+      });
+      expect(failRes.success).toBe(false);
+      expect(failRes.code).toBe('BIOMETRIC_FAILED');
+    });
   });
 });

@@ -7,7 +7,7 @@ export default defineConfig({
   clean: true,
   sourcemap: true,
   treeshake: true,
-  external: ['react', 'react-native', 'zod'],
+  external: ['react', 'react-native', 'zod', 'expo-local-authentication'],
   outExtension({ format }) {
     return {
       js: format === 'esm' ? '.mjs' : '.js',

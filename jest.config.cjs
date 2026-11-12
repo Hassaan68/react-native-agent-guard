@@ -6,6 +6,8 @@ module.exports = {
   testMatch: ['**/*.test.ts', '**/*.test.tsx'],
   moduleNameMapper: {
     '^react-native$': '<rootDir>/__mocks__/react-native.ts',
+    '^expo-local-authentication$':
+      '<rootDir>/__mocks__/expo-local-authentication.ts',
   },
   watchman: false,
   clearMocks: true,
