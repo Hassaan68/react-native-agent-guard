@@ -1,10 +1,24 @@
 import { z } from 'zod';
 import { authenticateWithExpoBiometrics } from './biometrics';
+import {
+  MCPSSETransportAdapter,
+  type MCPSSETransportOptions,
+  type MCPToolDescriptor,
+} from './mcp';
+import {
+  zodToClaudeSchema,
+  zodToMCPSchema,
+  zodToOpenAISchema,
+  type SchemaExportOptions,
+} from './schemaExporters';
 import type {
   ApprovalHandler,
   ApprovalRequest,
   AuditExecutionStatus,
   AuditLogEntry,
+  AuditOutcome,
+  AuditTelemetryCallback,
+  AuditTelemetryEvent,
   BiometricHandler,
   ClaudeToolSchema,
   MCPToolSchema,
@@ -50,11 +64,24 @@ export class ToolRegistry {
   private readonly tools = new Map<string, ToolDefinition<z.ZodType, unknown>>();
   private readonly options: ToolRegistryOptions;
   private readonly auditLog: AuditLogEntry[] = [];
+  private readonly auditListeners = new Set<AuditTelemetryCallback>();
   private providerApprovalHandler?: ApprovalHandler;
   private providerBiometricHandler?: BiometricHandler;
 
   constructor(options: ToolRegistryOptions = {}) {
     this.options = options;
+  }
+
+  /**
+   * Subscribe a telemetry listener that receives an `AuditTelemetryEvent`
+   * after every approved, denied, or failed tool execution.
+   * Returns an unsubscribe function.
+   */
+  public onAudit(listener: AuditTelemetryCallback): () => void {
+    this.auditListeners.add(listener);
+    return () => {
+      this.auditListeners.delete(listener);
+    };
   }
 
   /**
@@ -420,48 +447,53 @@ export class ToolRegistry {
   }
 
   /**
-   * Export all registered tools in OpenAI function-calling schema format
-   * using Zod v4's `z.toJSONSchema(schema, { target: 'draft-07' })`.
+   * Export all registered tools in OpenAI function-calling schema format.
+   * Safely handles `.transform()` and `.refine()` schemas and supports `{ strict: true }`.
    */
-  public toOpenAITools(): OpenAIToolSchema[] {
-    return Array.from(this.tools.entries()).map(([name, tool]) => ({
-      type: 'function',
-      function: {
-        name,
-        description: tool.description,
-        parameters: z.toJSONSchema(tool.inputSchema, {
-          target: 'draft-07',
-        }) as Record<string, unknown>,
-      },
-    }));
+  public toOpenAITools(options: SchemaExportOptions = {}): OpenAIToolSchema[] {
+    return Array.from(this.tools.entries()).map(([name, tool]) =>
+      zodToOpenAISchema(name, tool.description, tool.inputSchema, options),
+    );
   }
 
   /**
-   * Export all registered tools in Anthropic Claude `input_schema` format
-   * using Zod v4's `z.toJSONSchema(schema, { target: 'draft-07' })`.
+   * Export all registered tools in Anthropic Claude `input_schema` format.
+   * Safely handles `.transform()` and `.refine()` schemas and supports `{ strict: true }`.
    */
-  public toClaudeTools(): ClaudeToolSchema[] {
-    return Array.from(this.tools.entries()).map(([name, tool]) => ({
-      name,
-      description: tool.description,
-      input_schema: z.toJSONSchema(tool.inputSchema, {
-        target: 'draft-07',
-      }) as Record<string, unknown>,
-    }));
+  public toClaudeTools(options: SchemaExportOptions = {}): ClaudeToolSchema[] {
+    return Array.from(this.tools.entries()).map(([name, tool]) =>
+      zodToClaudeSchema(name, tool.description, tool.inputSchema, options),
+    );
   }
 
   /**
-   * Export all registered tools in Model Context Protocol (MCP) `inputSchema` format
-   * using Zod v4's `z.toJSONSchema(schema, { target: 'draft-07' })`.
+   * Export all registered tools in Model Context Protocol (MCP) `inputSchema` format.
+   * Safely handles `.transform()` and `.refine()` schemas.
    */
-  public toMCPTools(): MCPToolSchema[] {
-    return Array.from(this.tools.entries()).map(([name, tool]) => ({
-      name,
-      description: tool.description,
-      inputSchema: z.toJSONSchema(tool.inputSchema, {
-        target: 'draft-07',
-      }) as Record<string, unknown>,
-    }));
+  public toMCPTools(options: SchemaExportOptions = {}): MCPToolSchema[] {
+    return Array.from(this.tools.entries()).map(([name, tool]) =>
+      zodToMCPSchema(name, tool.description, tool.inputSchema, options),
+    );
+  }
+
+  /**
+   * Connect to a remote SSE-based Model Context Protocol (MCP) server,
+   * automatically discover available tools via `tools/list`, convert their
+   * JSON Schemas into Zod validators, and register them dynamically into this registry.
+   */
+  public async connectMCP(
+    transportOrOptions: MCPSSETransportAdapter | MCPSSETransportOptions,
+  ): Promise<{
+    transport: MCPSSETransportAdapter;
+    tools: MCPToolDescriptor[];
+  }> {
+    const transport =
+      transportOrOptions instanceof MCPSSETransportAdapter
+        ? transportOrOptions
+        : new MCPSSETransportAdapter(transportOrOptions);
+
+    const tools = await transport.registerTools(this);
+    return { transport, tools };
   }
 
   private async finalizeFailure<TOutput>(params: {
@@ -504,12 +536,54 @@ export class ToolRegistry {
     };
   }
 
+  private resolveOutcome(status: AuditExecutionStatus): AuditOutcome {
+    if (status === 'SUCCESS') {
+      return 'approved';
+    }
+    if (
+      status === 'DENIED_BY_POLICY' ||
+      status === 'USER_DENIED' ||
+      status === 'BIOMETRIC_FAILED'
+    ) {
+      return 'denied';
+    }
+    return 'failed';
+  }
+
   private async recordAudit(entry: AuditLogEntry): Promise<void> {
     const maxEntries =
       this.options.maxAuditEntries ?? DEFAULT_MAX_AUDIT_ENTRIES;
     this.auditLog.push(entry);
     if (this.auditLog.length > maxEntries) {
       this.auditLog.splice(0, this.auditLog.length - maxEntries);
+    }
+
+    const telemetryEvent: AuditTelemetryEvent = {
+      ...entry,
+      isoTimestamp: new Date(entry.timestamp).toISOString(),
+      arguments:
+        entry.parsedInput !== undefined ? entry.parsedInput : entry.rawInput,
+      outcome: this.resolveOutcome(entry.status),
+      duration: entry.durationMs,
+    };
+
+    const callbacks: AuditTelemetryCallback[] = [];
+    if (this.options.onAudit) {
+      callbacks.push(this.options.onAudit);
+    }
+    if (this.options.onExecution) {
+      callbacks.push(this.options.onExecution);
+    }
+    for (const listener of this.auditListeners) {
+      callbacks.push(listener);
+    }
+
+    for (const cb of callbacks) {
+      try {
+        await cb(telemetryEvent);
+      } catch {
+        // Never allow telemetry callback errors to interrupt tool execution
+      }
     }
 
     const storage = this.options.auditStorage;

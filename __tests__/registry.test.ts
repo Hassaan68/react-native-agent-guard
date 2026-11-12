@@ -6,9 +6,11 @@ import {
   createBleSyncToolPreset,
   createCalendarEventToolPreset,
   createGuardrails,
+  createMCPSSETransport,
   createPaymentToolPreset,
   createToolRegistry,
   type AuditStorageAdapter,
+  type AuditTelemetryEvent,
   type GuardrailConfig,
 } from '../src';
 
@@ -349,6 +351,86 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
         }),
       });
     });
+
+    it('safely exports OpenAI strict and Claude schemas for complex Zod schemas using .transform() and .refine()', async () => {
+      const registry = createToolRegistry();
+
+      const refinedPaymentSchema = z
+        .object({
+          recipient: z
+            .string()
+            .min(1)
+            .transform((val) => val.trim().toLowerCase()),
+          amount: z
+            .number()
+            .positive()
+            .refine((val) => val <= 10_000, {
+              message: 'Single transfer cannot exceed 10,000',
+            }),
+          currency: z
+            .string()
+            .length(3)
+            .transform((c) => c.toUpperCase()),
+        })
+        .refine((data) => data.recipient !== 'blocked_user', {
+          message: 'Transfers to blocked_user are not allowed',
+          path: ['recipient'],
+        });
+
+      registry.register('refined_transfer', {
+        description: 'Transfer funds with .transform() and .refine() rules',
+        inputSchema: refinedPaymentSchema,
+        policy: 'auto',
+        handler: (input) => input,
+      });
+
+      // Exporting to OpenAI (with strict: true), Claude, and MCP must not throw on .transform() or .refine()
+      const openAIStrict = registry.toOpenAITools({ strict: true });
+      expect(openAIStrict).toHaveLength(1);
+      expect(openAIStrict[0]?.function.strict).toBe(true);
+      expect(openAIStrict[0]?.function.parameters).toEqual(
+        expect.objectContaining({
+          type: 'object',
+          additionalProperties: false,
+          properties: expect.objectContaining({
+            recipient: expect.objectContaining({ type: 'string' }),
+            amount: expect.objectContaining({ type: 'number' }),
+            currency: expect.objectContaining({ type: 'string' }),
+          }),
+        }),
+      );
+
+      const claudeSchemas = registry.toClaudeTools({ strict: true });
+      expect(claudeSchemas).toHaveLength(1);
+      expect(claudeSchemas[0]?.input_schema).toEqual(
+        expect.objectContaining({
+          type: 'object',
+          additionalProperties: false,
+        }),
+      );
+
+      // Runtime execution applies .transform() and .refine()
+      const okResult = await registry.execute('refined_transfer', {
+        recipient: '  Alice@Example.com  ',
+        amount: 250,
+        currency: 'gbp',
+      });
+      expect(okResult.success).toBe(true);
+      expect(okResult.data).toEqual({
+        recipient: 'alice@example.com',
+        amount: 250,
+        currency: 'GBP',
+      });
+
+      const failedRefine = await registry.execute('refined_transfer', {
+        recipient: 'blocked_user',
+        amount: 250,
+        currency: 'usd',
+      });
+      expect(failedRefine.success).toBe(false);
+      expect(failedRefine.code).toBe('VALIDATION_ERROR');
+      expect(failedRefine.llmFeedback).toContain('blocked_user');
+    });
   });
 
   describe('7. Built-in mobile tool presets & AuditStorageAdapter', () => {
@@ -540,6 +622,225 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
       });
       expect(failRes.success).toBe(false);
       expect(failRes.code).toBe('BIOMETRIC_FAILED');
+    });
+  });
+
+  describe('9. Model Context Protocol (MCP) SSE Transport Adapter', () => {
+    it('connects to a remote SSE MCP server, discovers tools, validates schemas, and executes tools through GuardrailRegistry', async () => {
+      const mockFetch = jest.fn(async (url: string, init?: RequestInit) => {
+        // 1) Initial GET to SSE stream advertising session message endpoint
+        if (!init?.method || init.method === 'GET') {
+          return {
+            ok: true,
+            status: 200,
+            headers: {
+              get: () => 'text/event-stream',
+            },
+            text: async () =>
+              'event: endpoint\ndata: /mcp/messages?sessionId=abc123\n\n',
+          } as unknown as Response;
+        }
+
+        // 2) JSON-RPC POST requests
+        const body = JSON.parse(String(init.body));
+        if (body.method === 'initialize') {
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: async () =>
+              JSON.stringify({
+                jsonrpc: '2.0',
+                id: body.id,
+                result: {
+                  protocolVersion: '2024-11-05',
+                  serverInfo: { name: 'mock-mcp-server', version: '1.0.0' },
+                },
+              }),
+          } as unknown as Response;
+        }
+
+        if (body.method === 'tools/list') {
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: () => 'text/event-stream' },
+            text: async () =>
+              `event: message\ndata: ${JSON.stringify({
+                jsonrpc: '2.0',
+                id: body.id,
+                result: {
+                  tools: [
+                    {
+                      name: 'create_github_issue',
+                      description: 'Create an issue in a GitHub repository',
+                      inputSchema: {
+                        type: 'object',
+                        properties: {
+                          repo: { type: 'string', minLength: 3 },
+                          title: { type: 'string', minLength: 1 },
+                          priority: {
+                            type: 'string',
+                            enum: ['low', 'medium', 'high'],
+                          },
+                        },
+                        required: ['repo', 'title'],
+                      },
+                    },
+                  ],
+                },
+              })}\n\n`,
+          } as unknown as Response;
+        }
+
+        if (body.method === 'tools/call') {
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: async () =>
+              JSON.stringify({
+                jsonrpc: '2.0',
+                id: body.id,
+                result: {
+                  content: [
+                    {
+                      type: 'text',
+                      text: `Issue "${body.params.arguments.title}" created in ${body.params.arguments.repo}`,
+                    },
+                  ],
+                  issueNumber: 404,
+                },
+              }),
+          } as unknown as Response;
+        }
+
+        throw new Error(`Unexpected RPC method: ${body.method}`);
+      });
+
+      const onApprovalRequired = jest.fn(async () => true);
+      const guardrails = createGuardrails({
+        defaultPolicy: 'confirm',
+        onApprovalRequired,
+      });
+
+      const transport = createMCPSSETransport({
+        url: 'https://mcp.example.com/sse',
+        defaultPolicy: 'confirm',
+        fetchFn: mockFetch as unknown as typeof fetch,
+      });
+
+      const { tools } = await guardrails.connectMCP(transport);
+
+      expect(tools).toHaveLength(1);
+      expect(tools[0]?.name).toBe('create_github_issue');
+      expect(transport.getPostEndpoint()).toBe(
+        'https://mcp.example.com/mcp/messages?sessionId=abc123',
+      );
+      expect(guardrails.getToolNames()).toContain('create_github_issue');
+
+      // Validate that converted JSON Schema catches invalid inputs before hitting remote server
+      const invalidRes = await guardrails.execute('create_github_issue', {
+        repo: 'ab', // minLength is 3
+      });
+      expect(invalidRes.success).toBe(false);
+      expect(invalidRes.code).toBe('VALIDATION_ERROR');
+
+      // Valid input triggers 'confirm' policy and executes remote MCP tool call
+      const validRes = await guardrails.execute<{ issueNumber: number }>(
+        'create_github_issue',
+        {
+          repo: 'muhammadhassaan/react-native-agent-guard',
+          title: 'Support MCP SSE transport',
+          priority: 'high',
+        },
+      );
+
+      expect(validRes.success).toBe(true);
+      expect(validRes.policy).toBe('confirm');
+      expect(onApprovalRequired).toHaveBeenCalledTimes(1);
+      expect(validRes.data?.issueNumber).toBe(404);
+
+      transport.disconnect();
+      expect(transport.isConnected()).toBe(false);
+    });
+  });
+
+  describe('10. Global Audit & Execution Telemetry Callbacks (onAudit / onExecution)', () => {
+    it('emits structured telemetry payloads for approved, denied, and failed tool executions', async () => {
+      const events: AuditTelemetryEvent[] = [];
+      const onExecution = jest.fn();
+
+      const guardrails = createGuardrails({
+        defaultPolicy: 'auto',
+        onAudit: (event) => {
+          events.push(event);
+        },
+        onExecution,
+      });
+
+      const runtimeListener = jest.fn();
+      const unsubscribe = guardrails.onAudit(runtimeListener);
+
+      guardrails
+        .register('send_notification', {
+          description: 'Send push notification',
+          inputSchema: z.object({ title: z.string().min(3) }),
+          policy: 'auto',
+          handler: ({ title }) => ({ delivered: title }),
+        })
+        .register('restricted_action', {
+          description: 'Restricted admin tool',
+          inputSchema: z.object({ reason: z.string() }),
+          policy: 'deny',
+          handler: () => ({ ok: true }),
+        });
+
+      // 1) Approved execution
+      await guardrails.execute('send_notification', { title: 'Hello Agent' });
+
+      // 2) Denied execution
+      await guardrails.execute('restricted_action', { reason: 'test' });
+
+      // 3) Failed validation execution
+      await guardrails.execute('send_notification', { title: 'Hi' });
+
+      expect(events).toHaveLength(3);
+      expect(onExecution).toHaveBeenCalledTimes(3);
+      expect(runtimeListener).toHaveBeenCalledTimes(3);
+
+      expect(events[0]).toEqual(
+        expect.objectContaining({
+          toolName: 'send_notification',
+          arguments: { title: 'Hello Agent' },
+          policy: 'auto',
+          status: 'SUCCESS',
+          outcome: 'approved',
+        }),
+      );
+      expect(typeof events[0]?.isoTimestamp).toBe('string');
+
+      expect(events[1]).toEqual(
+        expect.objectContaining({
+          toolName: 'restricted_action',
+          arguments: { reason: 'test' },
+          policy: 'deny',
+          status: 'DENIED_BY_POLICY',
+          outcome: 'denied',
+        }),
+      );
+
+      expect(events[2]).toEqual(
+        expect.objectContaining({
+          toolName: 'send_notification',
+          status: 'VALIDATION_ERROR',
+          outcome: 'failed',
+        }),
+      );
+
+      unsubscribe();
+      await guardrails.execute('send_notification', { title: 'After Unsub' });
+      expect(runtimeListener).toHaveBeenCalledTimes(3);
     });
   });
 });

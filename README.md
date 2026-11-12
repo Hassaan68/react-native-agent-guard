@@ -256,49 +256,156 @@ export default function App() {
 
 ---
 
-## Exporting Schemas for OpenAI, Claude, and MCP
+## Exporting Strict Schemas for OpenAI, Claude, and MCP (`.transform()` & `.refine()` Safe)
 
-Define your tools once in `ToolRegistry` and export JSON Schema (`draft-07`) definitions for any LLM provider or Model Context Protocol client/server:
+Define complex tool schemas using Zod v4's `.transform()`, `.refine()`, and `.superRefine()` without worrying about JSON Schema serialization failures. `react-native-agent-guard` automatically extracts the LLM input contract (`io: 'input'`) during schema export while running full `.refine()` checks and `.transform()` pipelines at execution time:
 
 ```ts
-// 1. OpenAI Chat Completions / Responses API
-const openAITools = registry.toOpenAITools();
+import { z } from 'zod';
+import {
+  createGuardrails,
+  zodToOpenAISchema,
+  zodToClaudeSchema,
+} from 'react-native-agent-guard';
+
+const guardrails = createGuardrails();
+
+guardrails.register('send_payment', {
+  description: 'Send a peer-to-peer payment with normalized inputs',
+  inputSchema: z
+    .object({
+      recipient: z
+        .string()
+        .min(1)
+        .transform((val) => val.trim().toLowerCase()),
+      amount: z
+        .number()
+        .positive()
+        .refine((n) => n <= 10_000, 'Transfer cannot exceed $10,000'),
+      currency: z
+        .string()
+        .length(3)
+        .default('usd')
+        .transform((c) => c.toUpperCase()),
+    })
+    .refine((data) => data.recipient !== 'sanctioned@example.com', {
+      message: 'Recipient is restricted',
+      path: ['recipient'],
+    }),
+  policy: 'confirm',
+  handler: async (parsed) => {
+    // parsed.recipient is trimmed & lowercased; parsed.currency is uppercased!
+    return { status: 'SENT', ...parsed };
+  },
+});
+
+// 1. OpenAI Function Calling (with Strict Structured Outputs enabled)
+const openAITools = guardrails.toOpenAITools({ strict: true });
 /*
 [
   {
     type: 'function',
     function: {
       name: 'send_payment',
-      description: 'Send a peer-to-peer payment to a recipient',
-      parameters: { $schema: 'http://json-schema.org/draft-07/schema#', type: 'object', ... }
+      description: 'Send a peer-to-peer payment with normalized inputs',
+      strict: true,
+      parameters: {
+        $schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        additionalProperties: false,
+        properties: { ... },
+        required: ['recipient', 'amount']
+      }
     }
   }
 ]
 */
 
 // 2. Anthropic Claude Messages API
-const claudeTools = registry.toClaudeTools();
+const claudeTools = guardrails.toClaudeTools({ strict: true });
 /*
 [
   {
     name: 'send_payment',
-    description: 'Send a peer-to-peer payment to a recipient',
+    description: 'Send a peer-to-peer payment with normalized inputs',
     input_schema: { $schema: 'http://json-schema.org/draft-07/schema#', type: 'object', ... }
   }
 ]
 */
 
 // 3. Model Context Protocol (MCP)
-const mcpTools = registry.toMCPTools();
-/*
-[
-  {
-    name: 'send_payment',
-    description: 'Send a peer-to-peer payment to a recipient',
-    inputSchema: { $schema: 'http://json-schema.org/draft-07/schema#', type: 'object', ... }
-  }
-]
-*/
+const mcpTools = guardrails.toMCPTools();
+```
+
+---
+
+## Model Context Protocol (MCP) SSE Transport Adapter
+
+Connect your mobile agent directly to remote SSE-based **Model Context Protocol (MCP)** servers. `react-native-agent-guard` automatically performs the MCP `initialize` handshake, discovers remote tools via `tools/list`, converts their JSON Schemas (`draft-07`) into runtime Zod v4 validators, and registers them dynamically into `GuardrailRegistry` with full policy enforcement (`'auto' | 'confirm' | 'biometric' | 'deny'`).
+
+### 1. One-Line Connection via `guardrails.connectMCP()`
+
+```ts
+import { createGuardrails } from 'react-native-agent-guard';
+
+const guardrails = createGuardrails({
+  defaultPolicy: 'confirm',
+});
+
+// Connect to a remote MCP SSE server and auto-register all discovered tools
+const { transport, tools } = await guardrails.connectMCP({
+  url: 'https://mcp.your-server.com/sse',
+  headers: {
+    Authorization: 'Bearer YOUR_API_TOKEN',
+  },
+  defaultPolicy: 'confirm', // Require user confirmation by default for remote tools
+  toolPolicies: {
+    // Override policies for specific remote MCP tools
+    list_repositories: 'auto',
+    delete_repository: 'biometric',
+  },
+  timeoutMs: 15_000,
+});
+
+console.log(
+  'Registered remote MCP tools:',
+  tools.map((t) => t.name),
+);
+
+// Execute any discovered MCP tool safely through the guardrail pipeline
+const result = await guardrails.execute('delete_repository', {
+  repo: 'org/legacy-service',
+});
+
+// Disconnect when finished
+transport.disconnect();
+```
+
+### 2. Standalone `createMCPSSETransport()` Adapter
+
+For granular control over the MCP lifecycle (inspecting tools before registering or calling `callTool` directly):
+
+```ts
+import {
+  createGuardrails,
+  createMCPSSETransport,
+} from 'react-native-agent-guard';
+
+const guardrails = createGuardrails();
+
+const mcpTransport = createMCPSSETransport({
+  url: 'https://mcp.your-server.com/sse',
+  toolPrefix: 'github_', // Optional prefix -> e.g. 'github_create_issue'
+  defaultPolicy: 'confirm',
+});
+
+await mcpTransport.connect();
+
+// Inspect available remote tools
+const remoteTools = await mcpTransport.listTools();
+
+// Register them dynamically into GuardrailRegistry
+await mcpTransport.registerTools(guardrails);
 ```
 
 ---
@@ -366,22 +473,70 @@ registry
 
 ---
 
-## Persistent Audit Logging (`AsyncStorage` / `MMKV`)
+## Audit Telemetry & Persistent Logging (`onAudit` / `onExecution`)
 
-Pass any storage adapter implementing `{ getItem, setItem, removeItem? }` to persist execution logs across app restarts:
+Every tool execution lifecycle event—including `auto` executions, user modal approvals/rejections (`confirm`), hardware biometric outcomes (`biometric`), policy blocks (`deny`), validation failures, and runtime timeouts—automatically emits a structured [`AuditTelemetryEvent`](./src/types.ts) to your `onAudit` or `onExecution` hooks.
+
+### Telemetry Payload Shape
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `id` | `string` | Unique audit event identifier |
+| `timestamp` | `number` | Unix epoch timestamp (ms) when execution started |
+| `isoTimestamp` | `string` | ISO-8601 formatted timestamp string |
+| `toolName` | `string` | Name of the invoked tool |
+| `arguments` | `unknown` | Validated tool arguments (`parsedInput` or fallback `rawInput`) |
+| `policy` | `'auto' \| 'confirm' \| 'biometric' \| 'deny'` | Resolved guardrail policy |
+| `outcome` | `'approved' \| 'denied' \| 'failed'` | High-level governance outcome |
+| `status` | `AuditExecutionStatus` | Granular status (`SUCCESS`, `USER_DENIED`, `BIOMETRIC_FAILED`, `DENIED_BY_POLICY`, `VALIDATION_ERROR`, `TIMEOUT_ERROR`, `EXECUTION_ERROR`) |
+| `duration` / `durationMs` | `number` | Total execution duration in milliseconds |
+| `output` | `unknown` | Tool handler return value (when `outcome === 'approved'`) |
+| `errorMessage` | `string` | Detailed error or rejection message (when `outcome !== 'approved'`) |
+
+### Wiring Up Backend Analytics & Local Storage
 
 ```ts
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { createToolRegistry } from 'react-native-agent-guard';
+import { createGuardrails } from 'react-native-agent-guard';
 
-const registry = createToolRegistry({
+const guardrails = createGuardrails({
+  defaultPolicy: 'confirm',
+  // 1. Stream real-time governance telemetry to your backend or analytics SDK
+  onAudit: async (event) => {
+    console.log(
+      `[Audit] ${event.isoTimestamp} | ${event.toolName} | policy=${event.policy} | outcome=${event.outcome} (${event.status}) | ${event.duration}ms`,
+    );
+
+    // Example: forward structured telemetry to your observability endpoint
+    await fetch('https://telemetry.your-app.com/v1/agent-audit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        timestamp: event.timestamp,
+        toolName: event.toolName,
+        arguments: event.arguments,
+        policy: event.policy,
+        outcome: event.outcome,
+        status: event.status,
+        duration: event.duration,
+      }),
+    });
+  },
+  // 2. Optionally persist audit history to AsyncStorage or MMKV
   auditStorage: AsyncStorage,
   auditStorageKey: '@my-app/agent-audit-log',
   maxAuditEntries: 500,
 });
 
+// 3. Subscribe/unsubscribe dynamically inside React components
+const unsubscribe = guardrails.onAudit((event) => {
+  if (event.outcome === 'denied') {
+    console.warn(`Agent action "${event.toolName}" was blocked:`, event.status);
+  }
+});
+
 // Inspect in-memory execution history at any time
-const history = registry.getAuditLog();
+const history = guardrails.getAuditLog();
 ```
 
 ---
