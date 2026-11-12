@@ -10,6 +10,8 @@ import type {
 
 export * from './types';
 export * from './biometrics';
+export * from './mcp';
+export * from './schemaExporters';
 export * from './registry';
 export * from './ApprovalContext';
 export * from './AgentApprovalSheet';

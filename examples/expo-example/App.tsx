@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   StyleSheet,
   Text,
@@ -11,18 +11,25 @@ import {
 import { 
   createGuardrails, 
   type GuardrailRegistry,
+  type AuditTelemetryEvent,
   AgentApprovalProvider, 
   AgentApprovalSheet 
 } from 'react-native-agent-guard';
 import { z } from 'zod';
 
 // 1. Initialize the GuardrailRegistry using createGuardrails and register tools
-// with 'confirm' (UI sheet) and 'biometric' (native FaceID / TouchID) policies.
+// with 'confirm' (UI sheet), 'biometric' (native FaceID / TouchID), and an `onAudit` telemetry hook.
 const registry: GuardrailRegistry = createGuardrails({
   defaultPolicy: 'confirm',
   biometricOptions: {
     promptMessage: (req) => `Verify FaceID / TouchID to run ${req.toolName}`,
     cancelLabel: 'Cancel',
+  },
+  onAudit: (event) => {
+    console.log(
+      `[AgentGuard Audit] ${event.isoTimestamp} | tool=${event.toolName} | policy=${event.policy ?? 'n/a'} | outcome=${event.outcome} (${event.status}) | ${event.duration}ms`,
+      event.arguments,
+    );
   },
   checkPermission: (toolName) => {
     if (toolName === 'wire_transfer_biometric') {
@@ -36,10 +43,23 @@ const registry: GuardrailRegistry = createGuardrails({
 })
   .register('transfer_funds', {
     description: 'Transfer £150 to a saved beneficiary account',
-    inputSchema: z.object({
-      recipient: z.string(),
-      amountGBP: z.number().positive(),
-    }),
+    inputSchema: z
+      .object({
+        recipient: z
+          .string()
+          .min(1)
+          .transform((name) => name.trim()),
+        amountGBP: z
+          .number()
+          .positive()
+          .refine((amt) => amt <= 2500, {
+            message: 'Standard transfers cannot exceed £2,500',
+          }),
+      })
+      .refine((data) => data.recipient.toLowerCase() !== 'restricted', {
+        message: 'Transfers to restricted accounts are blocked',
+        path: ['recipient'],
+      }),
     policy: 'confirm', // <--- Triggers the in-app AgentApprovalSheet modal!
     handler: async ({ recipient, amountGBP }) => {
       // Runs only AFTER the user taps "Approve" on the UI sheet
@@ -49,8 +69,17 @@ const registry: GuardrailRegistry = createGuardrails({
   .register('wire_transfer_biometric', {
     description: 'Send a high-value £5,000 international wire transfer',
     inputSchema: z.object({
-      recipient: z.string(),
-      iban: z.string(),
+      recipient: z
+        .string()
+        .min(1)
+        .transform((val) => val.trim()),
+      iban: z
+        .string()
+        .min(10)
+        .transform((val) => val.replace(/\s+/g, '').toUpperCase())
+        .refine((val) => /^[A-Z]{2}[0-9A-Z]+$/.test(val), {
+          message: 'IBAN must start with a 2-letter country code',
+        }),
       amountGBP: z.number().positive(),
     }),
     policy: 'biometric', // <--- Triggers native FaceID / TouchID via expo-local-authentication!
@@ -66,9 +95,21 @@ const registry: GuardrailRegistry = createGuardrails({
     },
   });
 
+// Export strict OpenAI and Claude tool schemas (safely handling .transform() & .refine())
+export const openAIToolsPayload = registry.toOpenAITools({ strict: true });
+export const claudeToolsPayload = registry.toClaudeTools({ strict: true });
+
 export default function App() {
   const colorScheme = useColorScheme();
   const isDark = colorScheme === 'dark';
+  const [auditHistory, setAuditHistory] = useState<AuditTelemetryEvent[]>([]);
+
+  useEffect(() => {
+    // Subscribe to real-time execution audit telemetry events for UI state
+    return registry.onAudit((event) => {
+      setAuditHistory((prev) => [event, ...prev.slice(0, 2)]);
+    });
+  }, []);
 
   const handleTriggerAIAgentAction = async () => {
     console.log('AI Agent is attempting to call confirm tool...');
@@ -114,6 +155,109 @@ export default function App() {
     }
   };
 
+  const handleConnectAndRunMCPTool = async () => {
+    console.log('Connecting to remote MCP SSE endpoint...');
+
+    try {
+      // Connect to an MCP SSE endpoint, auto-discover tools, and register them into GuardrailRegistry
+      const { tools } = await registry.connectMCP({
+        url: 'https://mcp.demo.agent-guard.dev/sse',
+        defaultPolicy: 'confirm',
+        // Fallback demo SSE responder if the external server is unreachable offline
+        fetchFn: async (input, init) => {
+          try {
+            return await fetch(input, init);
+          } catch {
+            if (!init?.method || init.method === 'GET') {
+              return new Response(
+                'event: endpoint\ndata: https://mcp.demo.agent-guard.dev/messages\n\n',
+                { headers: { 'content-type': 'text/event-stream' } },
+              );
+            }
+            const rpc = JSON.parse(String(init.body));
+            if (rpc.method === 'initialize') {
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: rpc.id,
+                  result: { protocolVersion: '2024-11-05' },
+                }),
+                { headers: { 'content-type': 'application/json' } },
+              );
+            }
+            if (rpc.method === 'tools/list') {
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: rpc.id,
+                  result: {
+                    tools: [
+                      {
+                        name: 'mcp_cloud_deploy',
+                        description:
+                          'Deploy mobile release bundle via remote MCP server',
+                        inputSchema: {
+                          type: 'object',
+                          properties: {
+                            environment: {
+                              type: 'string',
+                              enum: ['staging', 'production'],
+                            },
+                            versionTag: { type: 'string' },
+                          },
+                          required: ['environment', 'versionTag'],
+                        },
+                      },
+                    ],
+                  },
+                }),
+                { headers: { 'content-type': 'application/json' } },
+              );
+            }
+            return new Response(
+              JSON.stringify({
+                jsonrpc: '2.0',
+                id: rpc.id,
+                result: {
+                  deploymentId: 'dep_mcp_778899',
+                  status: 'DEPLOYED',
+                  args: rpc.params?.arguments,
+                },
+              }),
+              { headers: { 'content-type': 'application/json' } },
+            );
+          }
+        },
+      });
+
+      const discoveredName = tools[0]?.name ?? 'mcp_cloud_deploy';
+      const result = await registry.execute<{
+        deploymentId: string;
+        status: string;
+      }>(discoveredName, {
+        environment: 'production',
+        versionTag: 'v0.1.4',
+      });
+
+      if (result.success && result.data) {
+        Alert.alert(
+          'MCP Tool Executed!',
+          `Deployment ID: ${result.data.deploymentId} (${result.data.status})`,
+        );
+      } else {
+        Alert.alert(
+          'MCP Action Blocked',
+          `Result: ${result.code} - ${result.llmFeedback}`,
+        );
+      }
+    } catch (err) {
+      Alert.alert(
+        'MCP Connection Error',
+        err instanceof Error ? err.message : 'Unknown error',
+      );
+    }
+  };
+
   return (
     // 2. Wrap your app tree with the AgentApprovalProvider
     <AgentApprovalProvider registry={registry}>
@@ -135,6 +279,29 @@ export default function App() {
         >
           <Text style={styles.buttonText}>Simulate Biometric Tool (£5,000)</Text>
         </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.button, styles.mcpButton]}
+          onPress={handleConnectAndRunMCPTool}
+        >
+          <Text style={styles.buttonText}>Connect MCP SSE & Run Tool</Text>
+        </TouchableOpacity>
+
+        {auditHistory.length > 0 ? (
+          <View style={[styles.auditCard, isDark && styles.auditCardDark]}>
+            <Text style={[styles.auditTitle, isDark && styles.headerDark]}>
+              Live Telemetry Stream ({auditHistory.length})
+            </Text>
+            {auditHistory.map((item) => (
+              <View key={item.id} style={styles.auditRow}>
+                <Text style={[styles.auditText, isDark && styles.subtextDark]}>
+                  • {item.toolName} [{item.policy ?? 'n/a'}] →{' '}
+                  {item.outcome.toUpperCase()} ({item.status}) • {item.duration}ms
+                </Text>
+              </View>
+            ))}
+          </View>
+        ) : null}
 
         {/* 3. Place the ready-made approval sheet with custom styling & theme support */}
         <AgentApprovalSheet
@@ -196,6 +363,9 @@ const styles = StyleSheet.create({
   biometricButton: {
     backgroundColor: '#7C3AED',
   },
+  mcpButton: {
+    backgroundColor: '#0D9488',
+  },
   buttonText: {
     color: '#fff',
     fontSize: 16,
@@ -212,5 +382,28 @@ const styles = StyleSheet.create({
   },
   customSheetButton: {
     borderRadius: 14,
+  },
+  auditCard: {
+    marginTop: 18,
+    padding: 14,
+    borderRadius: 12,
+    backgroundColor: '#E2E8F0',
+    width: '100%',
+  },
+  auditCardDark: {
+    backgroundColor: '#1E293B',
+  },
+  auditTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#0F172A',
+    marginBottom: 4,
+  },
+  auditRow: {
+    marginTop: 2,
+  },
+  auditText: {
+    fontSize: 12,
+    color: '#334155',
   },
 });

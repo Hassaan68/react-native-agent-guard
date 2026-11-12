@@ -121,6 +121,11 @@ export interface ToolExecutionResult<TOutput = unknown> {
 }
 
 /**
+ * High-level governance outcome category for telemetry and analytics.
+ */
+export type AuditOutcome = 'approved' | 'denied' | 'failed';
+
+/**
  * Entry recorded in the in-memory and optional persistent audit log.
  */
 export interface AuditLogEntry {
@@ -145,6 +150,28 @@ export interface AuditLogEntry {
   /** Error message on failure. */
   errorMessage?: string;
 }
+
+/**
+ * Structured telemetry payload emitted to `onAudit` / `onExecution` callbacks
+ * after every approved, denied, biometric, or failed tool invocation.
+ */
+export interface AuditTelemetryEvent extends AuditLogEntry {
+  /** ISO-8601 formatted timestamp string. */
+  isoTimestamp: string;
+  /** Normalized tool arguments (`parsedInput` if validated, otherwise `rawInput`). */
+  arguments: unknown;
+  /** High-level governance outcome (`'approved' | 'denied' | 'failed'`). */
+  outcome: AuditOutcome;
+  /** Execution duration in milliseconds (alias for `durationMs`). */
+  duration: number;
+}
+
+/**
+ * Callback invoked with a structured `AuditTelemetryEvent` after every tool execution attempt.
+ */
+export type AuditTelemetryCallback = (
+  event: AuditTelemetryEvent,
+) => void | Promise<void>;
 
 /**
  * Storage adapter interface compatible with AsyncStorage and MMKV wrappers.
@@ -177,6 +204,14 @@ export interface ToolRegistryOptions {
   auditStorageKey?: string;
   /** Maximum number of audit entries retained in memory and storage. Defaults to `500`. */
   maxAuditEntries?: number;
+  /**
+   * Optional telemetry callback invoked after every approved, denied, or failed tool execution.
+   */
+  onAudit?: AuditTelemetryCallback;
+  /**
+   * Alias for `onAudit` — invoked with a structured telemetry payload on every tool execution outcome.
+   */
+  onExecution?: AuditTelemetryCallback;
 }
 
 /**
@@ -187,6 +222,7 @@ export interface OpenAIToolSchema {
   function: {
     name: string;
     description: string;
+    strict?: boolean;
     parameters: Record<string, unknown>;
   };
 }
