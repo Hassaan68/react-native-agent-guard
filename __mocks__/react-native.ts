@@ -20,3 +20,9 @@ export const ScrollView = (props: Record<string, unknown>) =>
 export const StyleSheet = {
   create: <T extends Record<string, unknown>>(styles: T): T => styles,
 };
+
+export const Appearance = {
+  getColorScheme: (): 'light' | 'dark' => 'light',
+};
+
+export const useColorScheme = (): 'light' | 'dark' => 'light';
