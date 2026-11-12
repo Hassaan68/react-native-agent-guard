@@ -1,5 +1,13 @@
 import React from 'react';
-import { StyleSheet, Text, View, TouchableOpacity, Alert, Platform } from 'react-native';
+import {
+  StyleSheet,
+  Text,
+  View,
+  TouchableOpacity,
+  Alert,
+  Platform,
+  useColorScheme,
+} from 'react-native';
 import { 
   createGuardrails, 
   type GuardrailRegistry,
@@ -32,6 +40,9 @@ const registry: GuardrailRegistry = createGuardrails({
 });
 
 export default function App() {
+  const colorScheme = useColorScheme();
+  const isDark = colorScheme === 'dark';
+
   const handleTriggerAIAgentAction = async () => {
     console.log('AI Agent is attempting to call tool...');
     
@@ -56,18 +67,29 @@ export default function App() {
   return (
     // 2. Wrap your app tree with the AgentApprovalProvider
     <AgentApprovalProvider registry={registry}>
-      <View style={styles.container}>
-        <Text style={styles.header}>Agent Guard UI Test</Text>
-        <Text style={styles.subtext}>
-          Test human-in-the-loop workflow for mobile AI agents.
+      <View style={[styles.container, isDark && styles.containerDark]}>
+        <Text style={[styles.header, isDark && styles.headerDark]}>
+          Agent Guard UI Test
+        </Text>
+        <Text style={[styles.subtext, isDark && styles.subtextDark]}>
+          Test human-in-the-loop workflow for mobile AI agents ({isDark ? 'Dark' : 'Light'} Mode).
         </Text>
 
         <TouchableOpacity style={styles.button} onPress={handleTriggerAIAgentAction}>
           <Text style={styles.buttonText}>Simulate AI Agent Tool Call</Text>
         </TouchableOpacity>
 
-        {/* 3. Place the ready-made approval sheet anywhere inside the provider */}
-        <AgentApprovalSheet />
+        {/* 3. Place the ready-made approval sheet with custom styling & theme support */}
+        <AgentApprovalSheet
+          colorScheme={isDark ? 'dark' : 'light'}
+          sheetStyle={styles.customSheet}
+          titleStyle={styles.customSheetTitle}
+          buttonStyle={styles.customSheetButton}
+          theme={{
+            approveButtonBackground: '#007AFF',
+            approveButtonTextColor: '#FFFFFF',
+          }}
+        />
       </View>
     </AgentApprovalProvider>
   );
@@ -81,17 +103,26 @@ const styles = StyleSheet.create({
     backgroundColor: '#f8f9fa',
     padding: 20,
   },
+  containerDark: {
+    backgroundColor: '#0B0F19',
+  },
   header: {
     fontSize: 24,
     fontWeight: '700',
     color: '#111',
     marginBottom: 8,
   },
+  headerDark: {
+    color: '#F8FAFC',
+  },
   subtext: {
     fontSize: 14,
     color: '#666',
     textAlign: 'center',
     marginBottom: 30,
+  },
+  subtextDark: {
+    color: '#94A3B8',
   },
   button: {
     backgroundColor: '#007AFF',
@@ -108,5 +139,17 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
     fontWeight: '600',
+  },
+  customSheet: {
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: 24,
+  },
+  customSheetTitle: {
+    fontSize: 20,
+    letterSpacing: -0.3,
+  },
+  customSheetButton: {
+    borderRadius: 14,
   },
 });
