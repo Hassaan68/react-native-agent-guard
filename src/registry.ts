@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { authenticateWithExpoBiometrics } from './biometrics';
 import type {
   ApprovalHandler,
   ApprovalRequest,
@@ -303,21 +304,10 @@ export class ToolRegistry {
 
     if (resolvedPolicy === 'biometric') {
       const biometricHandler =
-        this.providerBiometricHandler ?? this.options.onBiometricRequired;
-
-      if (!biometricHandler) {
-        const message = `Tool "${toolName}" requires biometric authentication ('biometric' policy), but no onBiometricRequired handler is configured.`;
-        return this.finalizeFailure<TOutput>({
-          startTime,
-          toolName,
-          rawInput,
-          parsedInput,
-          policy: resolvedPolicy,
-          code: 'BIOMETRIC_FAILED',
-          message,
-          llmFeedback: `Biometric authentication for tool "${toolName}" is unavailable or failed.`,
-        });
-      }
+        this.providerBiometricHandler ??
+        this.options.onBiometricRequired ??
+        ((req: ApprovalRequest) =>
+          authenticateWithExpoBiometrics(req, this.options.biometricOptions));
 
       const request: ApprovalRequest = {
         id: generateId('biometric'),

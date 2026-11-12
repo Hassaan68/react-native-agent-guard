@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import type { BiometricAuthOptions } from './biometrics';
 
 /**
  * Execution policy for a registered agent tool.
@@ -166,8 +167,10 @@ export interface ToolRegistryOptions {
   defaultTimeoutMs?: number;
   /** Handler invoked when a tool requires `'confirm'` approval. */
   onApprovalRequired?: ApprovalHandler;
-  /** Handler invoked when a tool requires `'biometric'` authentication. */
+  /** Handler invoked when a tool requires `'biometric'` authentication. Defaults to `expo-local-authentication` when omitted. */
   onBiometricRequired?: BiometricHandler;
+  /** Optional configuration for native `expo-local-authentication` prompts when `policy: 'biometric'` is triggered. */
+  biometricOptions?: BiometricAuthOptions;
   /** Optional persistent storage adapter (e.g. AsyncStorage or MMKV) for audit logs. */
   auditStorage?: AuditStorageAdapter;
   /** Storage key used when persisting audit logs. Defaults to `'@react-native-agent-guard/audit-log'`. */

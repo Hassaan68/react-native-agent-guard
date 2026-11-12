@@ -9,6 +9,7 @@ import type {
 } from './types';
 
 export * from './types';
+export * from './biometrics';
 export * from './registry';
 export * from './ApprovalContext';
 export * from './AgentApprovalSheet';

@@ -16,35 +16,62 @@ import {
 } from 'react-native-agent-guard';
 import { z } from 'zod';
 
-// 1. Initialize the GuardrailRegistry using createGuardrails and register a tool with policy: 'confirm'
-// This forces execution to pause and trigger the UI modal automatically.
+// 1. Initialize the GuardrailRegistry using createGuardrails and register tools
+// with 'confirm' (UI sheet) and 'biometric' (native FaceID / TouchID) policies.
 const registry: GuardrailRegistry = createGuardrails({
   defaultPolicy: 'confirm',
+  biometricOptions: {
+    promptMessage: (req) => `Verify FaceID / TouchID to run ${req.toolName}`,
+    cancelLabel: 'Cancel',
+  },
   checkPermission: (toolName) => {
+    if (toolName === 'wire_transfer_biometric') {
+      return 'biometric';
+    }
     if (toolName === 'transfer_funds') {
       return 'confirm';
     }
     return true;
   },
-}).register('transfer_funds', {
-  description: 'Transfer £150 to a saved beneficiary account',
-  inputSchema: z.object({
-    recipient: z.string(),
-    amountGBP: z.number().positive(),
-  }),
-  policy: 'confirm', // <--- This triggers the UI approval sheet!
-  handler: async ({ recipient, amountGBP }) => {
-    // This only runs AFTER the user taps "Approve" on the UI sheet
-    return { success: true, txId: 'tx_live_998877', recipient, amountGBP };
-  },
-});
+})
+  .register('transfer_funds', {
+    description: 'Transfer £150 to a saved beneficiary account',
+    inputSchema: z.object({
+      recipient: z.string(),
+      amountGBP: z.number().positive(),
+    }),
+    policy: 'confirm', // <--- Triggers the in-app AgentApprovalSheet modal!
+    handler: async ({ recipient, amountGBP }) => {
+      // Runs only AFTER the user taps "Approve" on the UI sheet
+      return { success: true, txId: 'tx_live_998877', recipient, amountGBP };
+    },
+  })
+  .register('wire_transfer_biometric', {
+    description: 'Send a high-value £5,000 international wire transfer',
+    inputSchema: z.object({
+      recipient: z.string(),
+      iban: z.string(),
+      amountGBP: z.number().positive(),
+    }),
+    policy: 'biometric', // <--- Triggers native FaceID / TouchID via expo-local-authentication!
+    handler: async ({ recipient, iban, amountGBP }) => {
+      // Runs only AFTER native FaceID / TouchID succeeds
+      return {
+        success: true,
+        txId: 'tx_bio_445566',
+        recipient,
+        iban,
+        amountGBP,
+      };
+    },
+  });
 
 export default function App() {
   const colorScheme = useColorScheme();
   const isDark = colorScheme === 'dark';
 
   const handleTriggerAIAgentAction = async () => {
-    console.log('AI Agent is attempting to call tool...');
+    console.log('AI Agent is attempting to call confirm tool...');
     
     // Execute the tool call (this returns a Promise that pauses for UI approval)
     const result = await registry.execute<{
@@ -64,6 +91,29 @@ export default function App() {
     }
   };
 
+  const handleTriggerBiometricAction = async () => {
+    console.log('AI Agent is attempting to call biometric tool...');
+
+    // Execute the biometric-gated tool (triggers native FaceID / TouchID)
+    const result = await registry.execute<{
+      success: boolean;
+      txId: string;
+      recipient: string;
+      iban: string;
+      amountGBP: number;
+    }>('wire_transfer_biometric', {
+      recipient: 'Cyberdyne Systems',
+      iban: 'GB29NWBK60161331926819',
+      amountGBP: 5000.0,
+    });
+
+    if (result.success && result.data) {
+      Alert.alert('Biometric Wire Approved!', `Transaction ID: ${result.data.txId}`);
+    } else {
+      Alert.alert('Biometric Gate Blocked', `Result: ${result.code} - ${result.llmFeedback}`);
+    }
+  };
+
   return (
     // 2. Wrap your app tree with the AgentApprovalProvider
     <AgentApprovalProvider registry={registry}>
@@ -76,7 +126,14 @@ export default function App() {
         </Text>
 
         <TouchableOpacity style={styles.button} onPress={handleTriggerAIAgentAction}>
-          <Text style={styles.buttonText}>Simulate AI Agent Tool Call</Text>
+          <Text style={styles.buttonText}>Simulate Confirm Tool (£150)</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.button, styles.biometricButton]}
+          onPress={handleTriggerBiometricAction}
+        >
+          <Text style={styles.buttonText}>Simulate Biometric Tool (£5,000)</Text>
         </TouchableOpacity>
 
         {/* 3. Place the ready-made approval sheet with custom styling & theme support */}
@@ -129,11 +186,15 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     paddingHorizontal: 24,
     borderRadius: 12,
+    marginBottom: 14,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: Platform.OS === 'ios' ? 0.1 : 0.2,
     shadowRadius: 4,
     elevation: 3,
+  },
+  biometricButton: {
+    backgroundColor: '#7C3AED',
   },
   buttonText: {
     color: '#fff',
