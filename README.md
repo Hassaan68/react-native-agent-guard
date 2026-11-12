@@ -1,8 +1,8 @@
 # react-native-agent-guard
 
+[![CI](https://github.com/Hassaan68/react-native-agent-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/Hassaan68/react-native-agent-guard/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/react-native-agent-guard.svg?style=flat-square)](https://www.npmjs.com/package/react-native-agent-guard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](./LICENSE)
-[![CI Status](https://img.shields.io/github/actions/workflow/status/Hassaan68/react-native-agent-guard/ci.yml?branch=main&style=flat-square&label=tests)](https://github.com/Hassaan68/react-native-agent-guard/actions/workflows/ci.yml)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178C6.svg?style=flat-square&logo=typescript&logoColor=white)](./tsconfig.json)
 
 **Zero-dependency permission, policy, validation, and human-in-the-loop guardrails for autonomous AI agents in React Native.**
@@ -339,6 +339,77 @@ const mcpTools = guardrails.toMCPTools();
 
 ---
 
+## Framework Integrations (Vercel AI SDK & LangChain)
+
+Convert your `GuardrailRegistry` tools directly into executable tool definitions for the **Vercel AI SDK** (`ai`) and **LangChain.js** (`@langchain/core/tools`). Every tool invocation triggered by the framework automatically routes through your guardrail policy engine, `<AgentApprovalSheet />`, hardware biometrics (`expo-local-authentication`), and `onAudit` telemetry.
+
+### 1. Vercel AI SDK (`toVercelAITools`)
+
+```ts
+import { generateText } from 'ai';
+import { openai } from '@ai-sdk/openai';
+import { createGuardrails } from 'react-native-agent-guard';
+import { z } from 'zod';
+
+const guardrails = createGuardrails({ defaultPolicy: 'confirm' }).register(
+  'send_payment',
+  {
+    description: 'Send a peer-to-peer payment',
+    inputSchema: z.object({
+      recipient: z.string(),
+      amount: z.number().positive(),
+    }),
+    policy: ({ amount }) => (amount <= 50 ? 'auto' : 'biometric'),
+    handler: async ({ recipient, amount }) => ({
+      txId: `tx_${Date.now()}`,
+      recipient,
+      amount,
+    }),
+  },
+);
+
+// Convert registered tools into Vercel AI SDK format
+const tools = guardrails.toVercelAITools({ unwrapData: true });
+
+const { text, toolResults } = await generateText({
+  model: openai('gpt-4o'),
+  tools,
+  maxSteps: 3,
+  prompt: 'Send $120 to alice@example.com',
+});
+```
+
+### 2. LangChain.js (`toLangChainTools`)
+
+```ts
+import { DynamicStructuredTool } from '@langchain/core/tools';
+import { ChatAnthropic } from '@langchain/anthropic';
+import { createGuardrails, toLangChainTools } from 'react-native-agent-guard';
+
+const guardrails = createGuardrails({ defaultPolicy: 'confirm' });
+// ...register tools on `guardrails`
+
+// Option A: Pass directly to DynamicStructuredTool
+const langChainDefs = toLangChainTools(guardrails, { unwrapData: true });
+const structuredTools = langChainDefs.map(
+  (def) =>
+    new DynamicStructuredTool({
+      name: def.name,
+      description: def.description,
+      schema: def.schema,
+      func: def.func,
+    }),
+);
+
+// Option B: Or invoke directly via Runnable-compatible `.invoke()`
+const result = await langChainDefs[0].invoke({
+  recipient: 'bob@example.com',
+  amount: 40,
+});
+```
+
+---
+
 ## Model Context Protocol (MCP) SSE Transport Adapter
 
 Connect your mobile agent directly to remote SSE-based **Model Context Protocol (MCP)** servers. `react-native-agent-guard` automatically performs the MCP `initialize` handshake, discovers remote tools via `tools/list`, converts their JSON Schemas (`draft-07`) into runtime Zod v4 validators, and registers them dynamically into `GuardrailRegistry` with full policy enforcement (`'auto' | 'confirm' | 'biometric' | 'deny'`).
@@ -537,6 +608,45 @@ const unsubscribe = guardrails.onAudit((event) => {
 
 // Inspect in-memory execution history at any time
 const history = guardrails.getAuditLog();
+```
+
+---
+
+## Security & Threat Modeling
+
+`react-native-agent-guard` is architected with defense-in-depth against **indirect prompt injection, unauthorized tool execution, concurrent modal flooding, and rogue LLM tool calls**.
+
+See **[SECURITY.md](./SECURITY.md)** for our formal mobile agent threat model, trust boundary diagram, defense-in-depth mitigations, and private vulnerability reporting instructions.
+
+---
+
+## Contributing & Local Development
+
+We welcome pull requests, bug reports, and new mobile tool presets! See **[CONTRIBUTING.md](./CONTRIBUTING.md)** for full architectural guidelines.
+
+### Running Checks Locally
+
+```bash
+# 1. Install dependencies
+pnpm install
+
+# 2. Run linter
+pnpm lint
+
+# 3. Run strict TypeScript type-checking (core library + examples/expo-example/App.tsx)
+pnpm typecheck
+
+# 4. Run the Jest unit & integration test suite
+pnpm test
+
+# 5. Run tests in watch mode during development
+pnpm test:watch
+
+# 6. Run tests and generate coverage reports (/coverage)
+pnpm test:coverage
+
+# 7. Build CJS, ESM, and TypeScript declaration bundles (/dist)
+pnpm build
 ```
 
 ---

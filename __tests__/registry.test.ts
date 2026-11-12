@@ -9,10 +9,20 @@ import {
   createMCPSSETransport,
   createPaymentToolPreset,
   createToolRegistry,
+  toLangChainTools,
+  toVercelAITools,
+  zodToClaudeSchema,
+  zodToOpenAISchema,
   type AuditStorageAdapter,
   type AuditTelemetryEvent,
   type GuardrailConfig,
 } from '../src';
+import {
+  claudeToolsPayload,
+  langChainTools as exampleLangChainTools,
+  openAIToolsPayload,
+  vercelAITools as exampleVercelAITools,
+} from '../examples/expo-example/App';
 
 describe('react-native-agent-guard — ToolRegistry & Presets', () => {
   describe('1. auto policy execution & stringified JSON parsing', () => {
@@ -841,6 +851,228 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
       unsubscribe();
       await guardrails.execute('send_notification', { title: 'After Unsub' });
       expect(runtimeListener).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  describe('11. Framework Adapters (toVercelAITools & toLangChainTools)', () => {
+    it('routes Vercel AI SDK and LangChain.js tool executions through GuardrailRegistry policies and biometric gates', async () => {
+      const onApprovalRequired = jest.fn(async () => true);
+      const guardrails = createGuardrails({
+        defaultPolicy: 'confirm',
+        onApprovalRequired,
+      });
+
+      guardrails.register('book_flight', {
+        description: 'Book a flight ticket',
+        inputSchema: z.object({
+          destination: z.string().min(3),
+          seatClass: z.enum(['economy', 'business']).default('economy'),
+        }),
+        policy: 'confirm',
+        handler: ({ destination, seatClass }) => ({
+          bookingRef: 'FL_9900',
+          destination,
+          seatClass,
+        }),
+      });
+
+      // 1) Vercel AI SDK Adapter
+      const vercelTools = guardrails.toVercelAITools({ unwrapData: true });
+      expect(vercelTools.book_flight).toBeDefined();
+      expect(vercelTools.book_flight?.description).toBe('Book a flight ticket');
+      expect(vercelTools.book_flight?.parameters).toBeDefined();
+
+      const vercelOutput = await vercelTools.book_flight!.execute({
+        destination: 'London',
+        seatClass: 'business',
+      });
+      expect(onApprovalRequired).toHaveBeenCalledTimes(1);
+      expect(vercelOutput).toEqual({
+        bookingRef: 'FL_9900',
+        destination: 'London',
+        seatClass: 'business',
+      });
+
+      // 2) LangChain.js Adapter
+      const langChainTools = toLangChainTools(guardrails, { unwrapData: true });
+      expect(langChainTools).toHaveLength(1);
+      const lcFlightTool = langChainTools[0]!;
+      expect(lcFlightTool.name).toBe('book_flight');
+
+      const lcInvokeResult = await lcFlightTool.invoke({
+        destination: 'Tokyo',
+      });
+      expect(onApprovalRequired).toHaveBeenCalledTimes(2);
+      expect(lcInvokeResult).toEqual({
+        bookingRef: 'FL_9900',
+        destination: 'Tokyo',
+        seatClass: 'economy',
+      });
+
+      const lcFuncJson = await lcFlightTool.func({
+        destination: 'Paris',
+      });
+      expect(JSON.parse(lcFuncJson)).toEqual({
+        bookingRef: 'FL_9900',
+        destination: 'Paris',
+        seatClass: 'economy',
+      });
+    });
+
+    it('supports throwOnError and structured error feedback in Vercel AI SDK & LangChain adapters', async () => {
+      const guardrails = createGuardrails({
+        defaultPolicy: 'deny',
+      }).register('admin_purge', {
+        description: 'Purge database',
+        inputSchema: z.object({ confirmCode: z.string() }),
+        policy: 'deny',
+        handler: () => ({ purged: true }),
+      });
+
+      const vercelSafe = toVercelAITools(guardrails, { unwrapData: true });
+      const blockedRes = await vercelSafe.admin_purge!.execute({
+        confirmCode: '123',
+      });
+      expect(blockedRes).toEqual(
+        expect.objectContaining({
+          success: false,
+          error: 'DENIED_BY_POLICY',
+        }),
+      );
+
+      const vercelThrowing = toVercelAITools(guardrails, {
+        throwOnError: true,
+      });
+      await expect(
+        vercelThrowing.admin_purge!.execute({ confirmCode: '123' }),
+      ).rejects.toThrow(/denied by security policy/i);
+
+      const lcThrowing = toLangChainTools(guardrails, { throwOnError: true });
+      await expect(
+        lcThrowing[0]!.invoke({ confirmCode: '123' }),
+      ).rejects.toThrow(/denied by security policy/i);
+    });
+  });
+
+  describe('12. Edge Cases & Example App Integration', () => {
+    it('handles nested objects, arrays, and .superRefine() in zodToOpenAISchema & zodToClaudeSchema', () => {
+      const complexSchema = z
+        .object({
+          metadata: z.object({
+            source: z.string().transform((s) => s.trim()),
+          }),
+          tags: z.array(
+            z.object({
+              key: z.string(),
+              value: z.string(),
+            }),
+          ),
+        })
+        .superRefine((val, ctx) => {
+          if (val.tags.length === 0) {
+            ctx.addIssue({
+              code: 'custom',
+              message: 'At least one tag is required',
+              path: ['tags'],
+            });
+          }
+        });
+
+      const openAISchema = zodToOpenAISchema(
+        'tag_resource',
+        'Tag a cloud resource',
+        complexSchema,
+        { strict: true },
+      );
+      expect(openAISchema.function.strict).toBe(true);
+      expect(openAISchema.function.parameters.additionalProperties).toBe(false);
+
+      const claudeSchema = zodToClaudeSchema(
+        'tag_resource',
+        'Tag a cloud resource',
+        complexSchema,
+        { strict: true },
+      );
+      expect(claudeSchema.input_schema.additionalProperties).toBe(false);
+    });
+
+    it('rejects biometric execution when hardware is missing or not enrolled', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const LocalAuthentication = require('expo-local-authentication') as {
+        hasHardwareAsync: jest.Mock;
+        isEnrolledAsync: jest.Mock;
+      };
+
+      const guardrails = createGuardrails().register('biometric_only', {
+        description: 'Requires enrolled biometrics',
+        inputSchema: z.object({}),
+        policy: 'biometric',
+        handler: () => ({ ok: true }),
+      });
+
+      LocalAuthentication.hasHardwareAsync.mockResolvedValueOnce(false);
+      const noHwRes = await guardrails.execute('biometric_only', {});
+      expect(noHwRes.success).toBe(false);
+      expect(noHwRes.code).toBe('BIOMETRIC_FAILED');
+
+      LocalAuthentication.hasHardwareAsync.mockResolvedValueOnce(true);
+      LocalAuthentication.isEnrolledAsync.mockResolvedValueOnce(false);
+      const notEnrolledRes = await guardrails.execute('biometric_only', {});
+      expect(notEnrolledRes.success).toBe(false);
+      expect(notEnrolledRes.code).toBe('BIOMETRIC_FAILED');
+    });
+
+    it('enforces allowedTools and boolean checkPermission in GuardrailRegistry', async () => {
+      const guardrails = createGuardrails({
+        allowedTools: ['permitted_tool'],
+        checkPermission: (toolName, input) => {
+          if (
+            toolName === 'permitted_tool' &&
+            typeof input === 'object' &&
+            input !== null &&
+            (input as { block?: boolean }).block
+          ) {
+            return false;
+          }
+          return true;
+        },
+      })
+        .register('permitted_tool', {
+          description: 'Allowed tool',
+          inputSchema: z.object({ block: z.boolean().optional() }),
+          policy: 'auto',
+          handler: () => ({ ok: true }),
+        })
+        .register('unlisted_tool', {
+          description: 'Not in allowedTools',
+          inputSchema: z.object({}),
+          policy: 'auto',
+          handler: () => ({ ok: true }),
+        });
+
+      const unlistedRes = await guardrails.execute('unlisted_tool', {});
+      expect(unlistedRes.success).toBe(false);
+      expect(unlistedRes.code).toBe('DENIED_BY_POLICY');
+
+      const blockedByHook = await guardrails.execute('permitted_tool', {
+        block: true,
+      });
+      expect(blockedByHook.success).toBe(false);
+      expect(blockedByHook.code).toBe('DENIED_BY_POLICY');
+
+      const allowedRes = await guardrails.execute('permitted_tool', {
+        block: false,
+      });
+      expect(allowedRes.success).toBe(true);
+    });
+
+    it('aligns cleanly with exported payloads and adapters in examples/expo-example/App.tsx', () => {
+      expect(openAIToolsPayload).toHaveLength(2);
+      expect(openAIToolsPayload[0]?.function.strict).toBe(true);
+      expect(claudeToolsPayload).toHaveLength(2);
+      expect(exampleVercelAITools.transfer_funds).toBeDefined();
+      expect(exampleVercelAITools.wire_transfer_biometric).toBeDefined();
+      expect(exampleLangChainTools).toHaveLength(2);
     });
   });
 });
