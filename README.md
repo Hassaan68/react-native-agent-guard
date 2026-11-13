@@ -159,6 +159,83 @@ const policy = await guardrails.checkToolPermission('send_payment', {
 }); // -> 'biometric'
 ```
 
+---
+
+## Agent Loop Protection & Rate Limiting (`rateLimit`)
+
+Prevent runaway agent loops, hallucinated retry storms, and quota exhaustion by configuring `rateLimit` at either the global `createGuardrails()` level or per tool. When a tool exceeds `maxCallsPerMinute` or `maxSessionCalls`, `react-native-agent-guard` can either block execution with a `RATE_LIMITED` error (including self-correction `llmFeedback` telling the model to stop retrying) or dynamically escalate the policy from `'auto'` to `'confirm'` or `'biometric'`:
+
+```ts
+import { z } from 'zod';
+import { createGuardrails } from 'react-native-agent-guard';
+
+const guardrails = createGuardrails({
+  defaultPolicy: 'auto',
+  // Global fallback rate limit across tools
+  rateLimit: {
+    maxCallsPerMinute: 10,
+    maxSessionCalls: 50,
+    onLimitExceeded: 'deny', // Returns code: 'RATE_LIMITED' with self-correcting llmFeedback
+  },
+}).register('send_sms', {
+  description: 'Send an SMS notification to a contact',
+  inputSchema: z.object({
+    to: z.string(),
+    message: z.string().max(160),
+  }),
+  policy: 'auto',
+  // Per-tool rate limit: allow 2 automatic SMS calls per minute, then escalate to user confirmation!
+  rateLimit: {
+    maxCallsPerMinute: 2,
+    maxSessionCalls: 5,
+    onLimitExceeded: 'confirm', // 'deny' | 'confirm' | 'biometric'
+  },
+  handler: async ({ to, message }) => ({ deliveredTo: to, message }),
+});
+
+// Reset counters for a specific tool (or omit argument to reset all tools)
+guardrails.resetRateLimits('send_sms');
+```
+
+---
+
+## Built-In PII Redaction & Argument Sanitization (`redactPII`)
+
+Automatically scrub Personally Identifiable Information (PII) and credentials from `onAudit` / `onExecution` telemetry payloads, in-memory `getAuditLog()` entries, and persistent `AuditStorageAdapter` (`AsyncStorage` / `MMKV`) logs **without mutating the validated arguments passed to your tool handler**:
+
+- **Built-in Pattern Masking**: Emails (`[REDACTED_EMAIL]`), Phone Numbers (`[REDACTED_PHONE]`), Credit Cards (`[REDACTED_CARD]`), SSNs (`[REDACTED_SSN]`), and JWT / Bearer Tokens (`[REDACTED_TOKEN]`).
+- **Sensitive Key Masking**: Automatically masks object fields named `password`, `secret`, `token`, `apiKey`, `authorization`, `ssn`, `cvv`, `pin`, `privateKey`, `cardNumber`, plus any custom `sensitiveKeys`.
+
+```ts
+import { createGuardrails, redactPIIValue } from 'react-native-agent-guard';
+
+const guardrails = createGuardrails({
+  defaultPolicy: 'confirm',
+  redactPII: {
+    enabled: true,
+    sensitiveKeys: ['iban', 'routingNumber'],
+    customPatterns: [
+      {
+        name: 'account_id',
+        pattern: /ACC-\d{6}/g,
+        replacement: '[REDACTED_ACC]',
+      },
+    ],
+  },
+  onAudit: (event) => {
+    // event.arguments and event.output are automatically redacted before reaching your telemetry backend!
+    console.log('Sanitized audit payload:', event.arguments);
+  },
+});
+
+// You can also use redactPIIValue() standalone anywhere in your app:
+const clean = redactPIIValue({
+  note: 'Contact alice@example.com or +1-555-234-5678',
+  apiKey: 'sk_live_12345',
+});
+// -> { note: 'Contact [REDACTED_EMAIL] or [REDACTED_PHONE]', apiKey: '[REDACTED]' }
+```
+
 ### 2. Register Tools & Connect React Native Approval UI
 
 ```tsx
@@ -648,6 +725,10 @@ pnpm test:coverage
 # 7. Build CJS, ESM, and TypeScript declaration bundles (/dist)
 pnpm build
 ```
+
+### Automated Releases & npm Provenance
+
+Releases are published automatically via GitHub Actions ([`.github/workflows/release.yml`](./.github/workflows/release.yml)) whenever a new GitHub Release is published. The workflow runs `npm ci`, `npm run typecheck`, `npm test`, and `npm run build` before publishing with cryptographic SLSA build provenance (`npm publish --provenance --access public`) using GitHub OIDC (`id-token: write`) and `secrets.NPM_TOKEN`.
 
 ---
 

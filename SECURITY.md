@@ -23,10 +23,12 @@
 
 ## 1. Supported Versions
 
-Security patches are released on the latest minor/patch track of `react-native-agent-guard`:
+Security patches are released on the latest minor/patch track of `react-native-agent-guard`. Official npm releases are built and published via GitHub Actions ([`.github/workflows/release.yml`](./.github/workflows/release.yml)) with **npm cryptographic SLSA provenance** (`npm publish --provenance --access public` with OIDC `id-token: write`), allowing consumers to verify that every published tarball on npm was built directly from this repository's signed commit history.
 
 | Version | Supported          |
 | :------ | :----------------- |
+| `0.3.x` | :white_check_mark: |
+| `0.2.x` | :white_check_mark: |
 | `0.1.x` | :white_check_mark: |
 | `< 0.1.0` | :x:              |
 

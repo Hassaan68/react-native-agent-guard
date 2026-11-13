@@ -18,9 +18,19 @@ import {
 import { z } from 'zod';
 
 // 1. Initialize the GuardrailRegistry using createGuardrails and register tools
-// with 'confirm' (UI sheet), 'biometric' (native FaceID / TouchID), and an `onAudit` telemetry hook.
+// with 'confirm' (UI sheet), 'biometric' (native FaceID / TouchID), `rateLimit` loop protection, and an `onAudit` telemetry hook.
 const registry: GuardrailRegistry = createGuardrails({
   defaultPolicy: 'confirm',
+  rateLimit: {
+    maxCallsPerMinute: 5,
+    maxSessionCalls: 10,
+    onLimitExceeded: 'deny',
+  },
+  // Automatically mask PII (emails, phones, cards, SSNs, tokens) and custom sensitive keys in audit telemetry
+  redactPII: {
+    enabled: true,
+    sensitiveKeys: ['iban'],
+  },
   biometricOptions: {
     promptMessage: (req) => `Verify FaceID / TouchID to run ${req.toolName}`,
     cancelLabel: 'Cancel',
@@ -61,6 +71,11 @@ const registry: GuardrailRegistry = createGuardrails({
         path: ['recipient'],
       }),
     policy: 'confirm', // <--- Triggers the in-app AgentApprovalSheet modal!
+    rateLimit: {
+      maxCallsPerMinute: 3,
+      maxSessionCalls: 5,
+      onLimitExceeded: 'deny',
+    },
     handler: async ({ recipient, amountGBP }) => {
       // Runs only AFTER the user taps "Approve" on the UI sheet
       return { success: true, txId: 'tx_live_998877', recipient, amountGBP };
