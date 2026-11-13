@@ -10,6 +10,7 @@ import type {
 
 export * from './types';
 export * from './biometrics';
+export * from './redaction';
 export * from './mcp';
 export * from './schemaExporters';
 export * from './adapters';

@@ -1075,4 +1075,178 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
       expect(exampleLangChainTools).toHaveLength(2);
     });
   });
+
+  describe('13. Agent Loop Protection & Rate Limiting (rateLimit)', () => {
+    it('blocks runaway agent loops with RATE_LIMITED error and self-correcting llmFeedback when quota is exceeded', async () => {
+      const handler = jest.fn(({ query }: { query: string }) => ({
+        results: [query],
+      }));
+
+      const guardrails = createGuardrails({
+        defaultPolicy: 'auto',
+        rateLimit: {
+          maxCallsPerMinute: 2,
+          maxSessionCalls: 3,
+          onLimitExceeded: 'deny',
+        },
+      }).register('search_knowledge_base', {
+        description: 'Search local knowledge base',
+        inputSchema: z.object({ query: z.string() }),
+        policy: 'auto',
+        handler,
+      });
+
+      const call1 = await guardrails.execute('search_knowledge_base', {
+        query: 'q1',
+      });
+      const call2 = await guardrails.execute('search_knowledge_base', {
+        query: 'q2',
+      });
+      const call3 = await guardrails.execute('search_knowledge_base', {
+        query: 'q3',
+      });
+
+      expect(call1.success).toBe(true);
+      expect(call2.success).toBe(true);
+      expect(call3.success).toBe(false);
+      expect(call3.code).toBe('RATE_LIMITED');
+      expect(call3.error?.code).toBe('RATE_LIMITED');
+      expect(call3.llmFeedback).toContain('Stop retrying tool');
+      expect(handler).toHaveBeenCalledTimes(2);
+
+      // Reset rate limits and verify execution succeeds again
+      guardrails.resetRateLimits('search_knowledge_base');
+      const afterReset = await guardrails.execute('search_knowledge_base', {
+        query: 'q4',
+      });
+      expect(afterReset.success).toBe(true);
+    });
+
+    it('escalates policy from auto to confirm or biometric when onLimitExceeded is configured to escalate', async () => {
+      const onApprovalRequired = jest.fn(async () => true);
+
+      const guardrails = createGuardrails({
+        defaultPolicy: 'auto',
+        onApprovalRequired,
+      }).register('send_sms', {
+        description: 'Send an SMS message',
+        inputSchema: z.object({ to: z.string(), body: z.string() }),
+        policy: 'auto',
+        rateLimit: {
+          maxSessionCalls: 1,
+          onLimitExceeded: 'confirm',
+        },
+        handler: ({ to }) => ({ sentTo: to }),
+      });
+
+      // 1st call is within maxSessionCalls (1) -> executes with 'auto' policy
+      const first = await guardrails.execute('send_sms', {
+        to: '+15550001',
+        body: 'First SMS',
+      });
+      expect(first.success).toBe(true);
+      expect(first.policy).toBe('auto');
+      expect(onApprovalRequired).not.toHaveBeenCalled();
+
+      // 2nd call exceeds maxSessionCalls (1) -> escalates from 'auto' to 'confirm'
+      const second = await guardrails.execute('send_sms', {
+        to: '+15550002',
+        body: 'Second SMS',
+      });
+      expect(second.success).toBe(true);
+      expect(second.policy).toBe('confirm');
+      expect(onApprovalRequired).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('14. Built-In PII Redaction & Argument Sanitization (redactPII)', () => {
+    it('redacts emails, phones, cards, SSNs, JWT/Bearer tokens, and sensitive keys in onAudit and AuditStorageAdapter without mutating handler input', async () => {
+      const memoryStore = new Map<string, string>();
+      const auditStorage: AuditStorageAdapter = {
+        getItem: (key) => memoryStore.get(key) ?? null,
+        setItem: (key, val) => {
+          memoryStore.set(key, val);
+        },
+      };
+
+      const auditEvents: AuditTelemetryEvent[] = [];
+      let handlerReceivedInput: unknown;
+
+      const guardrails = createGuardrails({
+        defaultPolicy: 'auto',
+        auditStorage,
+        redactPII: {
+          enabled: true,
+          sensitiveKeys: ['iban'],
+          customPatterns: [
+            {
+              name: 'internal_id',
+              pattern: /EMP-\d{4}/g,
+              replacement: '[REDACTED_EMP_ID]',
+            },
+          ],
+        },
+        onAudit: (event) => {
+          auditEvents.push(event);
+        },
+      }).register('submit_kyc_profile', {
+        description: 'Submit KYC profile with sensitive fields',
+        inputSchema: z.object({
+          contactNote: z.string(),
+          authHeader: z.string(),
+          jwt: z.string(),
+          apiKey: z.string(),
+          iban: z.string(),
+        }),
+        policy: 'auto',
+        handler: (input) => {
+          handlerReceivedInput = input;
+          return {
+            status: 'VERIFIED',
+            confirmationSentTo: 'alice.smith@example.com',
+          };
+        },
+      });
+
+      const rawPayload = {
+        contactNote:
+          'Email alice.smith@example.com, call +1-555-234-5678, SSN 123-45-6789, card 4111 2222 3333 4444, ref EMP-9021',
+        authHeader: 'Bearer sk_live_secret_token_998877',
+        jwt: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+        apiKey: 'super_secret_key_value',
+        iban: 'GB29NWBK60161331926819',
+      };
+
+      const res = await guardrails.execute('submit_kyc_profile', rawPayload);
+      expect(res.success).toBe(true);
+
+      // 1) Handler receives unmutated validated input
+      expect(handlerReceivedInput).toEqual(rawPayload);
+
+      // 2) onAudit telemetry receives redacted arguments and output
+      expect(auditEvents).toHaveLength(1);
+      const auditedArgs = auditEvents[0]?.arguments as Record<string, string>;
+      expect(auditedArgs.contactNote).toContain('[REDACTED_EMAIL]');
+      expect(auditedArgs.contactNote).toContain('[REDACTED_PHONE]');
+      expect(auditedArgs.contactNote).toContain('[REDACTED_SSN]');
+      expect(auditedArgs.contactNote).toContain('[REDACTED_CARD]');
+      expect(auditedArgs.contactNote).toContain('[REDACTED_EMP_ID]');
+      expect(auditedArgs.contactNote).not.toContain('alice.smith@example.com');
+      expect(auditedArgs.contactNote).not.toContain('123-45-6789');
+      expect(auditedArgs.contactNote).not.toContain('4111 2222 3333 4444');
+      expect(auditedArgs.authHeader).toBe('[REDACTED_TOKEN]');
+      expect(auditedArgs.jwt).toBe('[REDACTED_TOKEN]');
+      expect(auditedArgs.apiKey).toBe('[REDACTED]');
+      expect(auditedArgs.iban).toBe('[REDACTED]');
+
+      // 3) Persistent AuditStorageAdapter also stores redacted entries
+      const persistedRaw = memoryStore.get(
+        '@react-native-agent-guard/audit-log',
+      );
+      expect(persistedRaw).toBeDefined();
+      expect(persistedRaw).not.toContain('alice.smith@example.com');
+      expect(persistedRaw).not.toContain('super_secret_key_value');
+      expect(persistedRaw).not.toContain('GB29NWBK60161331926819');
+    });
+  });
 });

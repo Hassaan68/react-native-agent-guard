@@ -1,5 +1,6 @@
 import type { z } from 'zod';
 import type { BiometricAuthOptions } from './biometrics';
+import type { PIIRedactionOption } from './redaction';
 
 /**
  * Execution policy for a registered agent tool.
@@ -18,6 +19,29 @@ export type PolicyResolver<TInput = unknown> =
   | ((parsedInput: TInput) => ToolPolicy | Promise<ToolPolicy>);
 
 /**
+ * Action taken when a tool exceeds its configured `rateLimit` (`maxCallsPerMinute` or `maxSessionCalls`).
+ * - `'deny'`: Block execution immediately with `code: 'RATE_LIMITED'` and self-correction `llmFeedback`.
+ * - `'confirm'`: Escalate the execution policy to require explicit user modal approval (`<AgentApprovalSheet />`).
+ * - `'biometric'`: Escalate the execution policy to require hardware biometric authentication (`FaceID` / `TouchID`).
+ */
+export type RateLimitExceededAction = 'deny' | 'confirm' | 'biometric';
+
+/**
+ * Agent loop protection and rate-limiting configuration at the global registry or per-tool level.
+ */
+export interface RateLimitConfig {
+  /** Maximum number of calls allowed within a rolling 60-second window. */
+  maxCallsPerMinute?: number;
+  /** Maximum total number of calls allowed during the current registry session. */
+  maxSessionCalls?: number;
+  /**
+   * Behavior when `maxCallsPerMinute` or `maxSessionCalls` is exceeded.
+   * Defaults to `'deny'` (returns `RATE_LIMITED`). Set to `'confirm'` or `'biometric'` to escalate policy instead.
+   */
+  onLimitExceeded?: RateLimitExceededAction;
+}
+
+/**
  * Configuration for registering a tool in the registry.
  */
 export interface ToolDefinition<
@@ -32,6 +56,8 @@ export interface ToolDefinition<
   policy?: PolicyResolver<z.infer<TSchema>>;
   /** Optional execution timeout in milliseconds. Overrides registry's `defaultTimeoutMs`. */
   timeoutMs?: number;
+  /** Optional per-tool rate limit and loop protection configuration. Overrides global `rateLimit`. */
+  rateLimit?: RateLimitConfig;
   /** Tool execution handler invoked only after validation and policy checks succeed. */
   handler: (parsedInput: z.infer<TSchema>) => TOutput | Promise<TOutput>;
 }
@@ -78,6 +104,7 @@ export type ToolExecutionErrorCode =
   | 'TOOL_NOT_FOUND'
   | 'VALIDATION_ERROR'
   | 'DENIED_BY_POLICY'
+  | 'RATE_LIMITED'
   | 'USER_DENIED'
   | 'BIOMETRIC_FAILED'
   | 'TIMEOUT_ERROR'
@@ -212,6 +239,15 @@ export interface ToolRegistryOptions {
    * Alias for `onAudit` — invoked with a structured telemetry payload on every tool execution outcome.
    */
   onExecution?: AuditTelemetryCallback;
+  /**
+   * Optional global agent loop protection and rate-limiting rules applied across registered tools.
+   */
+  rateLimit?: RateLimitConfig;
+  /**
+   * Built-in PII redaction and argument sanitization for audit logs and `onAudit`/`onExecution` telemetry.
+   * Masks emails, phone numbers, credit cards, SSNs, JWT/Bearer tokens, and sensitive keys without mutating handler input.
+   */
+  redactPII?: PIIRedactionOption;
 }
 
 /**

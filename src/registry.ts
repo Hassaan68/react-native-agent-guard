@@ -13,6 +13,7 @@ import {
   type MCPSSETransportOptions,
   type MCPToolDescriptor,
 } from './mcp';
+import { redactPIIValue } from './redaction';
 import {
   zodToClaudeSchema,
   zodToMCPSchema,
@@ -31,6 +32,8 @@ import type {
   ClaudeToolSchema,
   MCPToolSchema,
   OpenAIToolSchema,
+  RateLimitConfig,
+  RateLimitExceededAction,
   ToolDefinition,
   ToolExecutionErrorCode,
   ToolExecutionResult,
@@ -73,11 +76,26 @@ export class ToolRegistry {
   private readonly options: ToolRegistryOptions;
   private readonly auditLog: AuditLogEntry[] = [];
   private readonly auditListeners = new Set<AuditTelemetryCallback>();
+  private readonly toolCallTimestamps = new Map<string, number[]>();
+  private readonly toolSessionCounts = new Map<string, number>();
   private providerApprovalHandler?: ApprovalHandler;
   private providerBiometricHandler?: BiometricHandler;
 
   constructor(options: ToolRegistryOptions = {}) {
     this.options = options;
+  }
+
+  /**
+   * Reset rate-limit and session counters for a specific tool, or for all tools if `toolName` is omitted.
+   */
+  public resetRateLimits(toolName?: string): void {
+    if (toolName) {
+      this.toolCallTimestamps.delete(toolName);
+      this.toolSessionCounts.delete(toolName);
+      return;
+    }
+    this.toolCallTimestamps.clear();
+    this.toolSessionCounts.clear();
   }
 
   /**
@@ -288,6 +306,28 @@ export class ToolRegistry {
       });
     }
 
+    // 3b. Evaluate agent loop protection & rate limits (per-tool overrides global)
+    const rateLimitCheck = this.evaluateRateLimit(toolName, tool.rateLimit);
+    if (rateLimitCheck.exceeded) {
+      const action: RateLimitExceededAction =
+        rateLimitCheck.onLimitExceeded ?? 'deny';
+      if (action === 'deny') {
+        const message = rateLimitCheck.reason;
+        return this.finalizeFailure<TOutput>({
+          startTime,
+          toolName,
+          rawInput,
+          parsedInput,
+          policy: resolvedPolicy,
+          code: 'RATE_LIMITED',
+          message,
+          llmFeedback: `${message} Stop retrying tool "${toolName}" in a loop and inform the user or proceed with an alternative step.`,
+        });
+      }
+      // Escalate policy to 'confirm' or 'biometric' when onLimitExceeded is set accordingly
+      resolvedPolicy = action;
+    }
+
     if (resolvedPolicy === 'confirm') {
       const approvalHandler =
         this.providerApprovalHandler ?? this.options.onApprovalRequired;
@@ -379,12 +419,21 @@ export class ToolRegistry {
     const timeoutMs =
       tool.timeoutMs ?? this.options.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
 
+    const shouldRedactHandlerInput =
+      typeof this.options.redactPII === 'object' &&
+      this.options.redactPII !== null &&
+      this.options.redactPII.redactHandlerInput === true;
+
+    const handlerInput = shouldRedactHandlerInput
+      ? redactPIIValue(parsedInput, this.options.redactPII)
+      : parsedInput;
+
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const timeoutSymbol = Symbol('TIMEOUT');
 
     try {
       const executionPromise = Promise.resolve().then(() =>
-        tool.handler(parsedInput),
+        tool.handler(handlerInput),
       );
 
       const raceResult =
@@ -566,12 +615,79 @@ export class ToolRegistry {
     };
   }
 
+  private evaluateRateLimit(
+    toolName: string,
+    toolRateLimit?: RateLimitConfig,
+  ): {
+    exceeded: boolean;
+    reason: string;
+    onLimitExceeded?: RateLimitExceededAction;
+  } {
+    const globalLimit = this.options.rateLimit;
+    const effectiveConfig: RateLimitConfig | undefined =
+      toolRateLimit || globalLimit
+        ? {
+            maxCallsPerMinute:
+              toolRateLimit?.maxCallsPerMinute ??
+              globalLimit?.maxCallsPerMinute,
+            maxSessionCalls:
+              toolRateLimit?.maxSessionCalls ?? globalLimit?.maxSessionCalls,
+            onLimitExceeded:
+              toolRateLimit?.onLimitExceeded ??
+              globalLimit?.onLimitExceeded ??
+              'deny',
+          }
+        : undefined;
+
+    if (!effectiveConfig) {
+      return { exceeded: false, reason: '' };
+    }
+
+    const now = Date.now();
+    const windowStart = now - 60_000;
+
+    const existingTimestamps = this.toolCallTimestamps.get(toolName) ?? [];
+    const recentTimestamps = existingTimestamps.filter(
+      (ts) => ts > windowStart,
+    );
+    recentTimestamps.push(now);
+    this.toolCallTimestamps.set(toolName, recentTimestamps);
+
+    const nextSessionCount = (this.toolSessionCounts.get(toolName) ?? 0) + 1;
+    this.toolSessionCounts.set(toolName, nextSessionCount);
+
+    if (
+      effectiveConfig.maxSessionCalls !== undefined &&
+      nextSessionCount > effectiveConfig.maxSessionCalls
+    ) {
+      return {
+        exceeded: true,
+        reason: `Rate limit exceeded for tool "${toolName}": session call quota (${effectiveConfig.maxSessionCalls}) reached.`,
+        onLimitExceeded: effectiveConfig.onLimitExceeded,
+      };
+    }
+
+    if (
+      effectiveConfig.maxCallsPerMinute !== undefined &&
+      recentTimestamps.length > effectiveConfig.maxCallsPerMinute
+    ) {
+      return {
+        exceeded: true,
+        reason: `Rate limit exceeded for tool "${toolName}": maximum call frequency (${effectiveConfig.maxCallsPerMinute} calls/min) exceeded.`,
+        onLimitExceeded: effectiveConfig.onLimitExceeded,
+      };
+    }
+
+    return { exceeded: false, reason: '' };
+  }
+
   private resolveOutcome(status: AuditExecutionStatus): AuditOutcome {
     if (status === 'SUCCESS') {
       return 'approved';
     }
     if (
       status === 'DENIED_BY_POLICY' ||
+      status === 'RATE_LIMITED' ||
       status === 'USER_DENIED' ||
       status === 'BIOMETRIC_FAILED'
     ) {
@@ -581,20 +697,36 @@ export class ToolRegistry {
   }
 
   private async recordAudit(entry: AuditLogEntry): Promise<void> {
+    const piiOption = this.options.redactPII;
+    const sanitizedEntry: AuditLogEntry = piiOption
+      ? {
+          ...entry,
+          rawInput: redactPIIValue(entry.rawInput, piiOption),
+          ...(entry.parsedInput !== undefined
+            ? { parsedInput: redactPIIValue(entry.parsedInput, piiOption) }
+            : {}),
+          ...(entry.output !== undefined
+            ? { output: redactPIIValue(entry.output, piiOption) }
+            : {}),
+        }
+      : entry;
+
     const maxEntries =
       this.options.maxAuditEntries ?? DEFAULT_MAX_AUDIT_ENTRIES;
-    this.auditLog.push(entry);
+    this.auditLog.push(sanitizedEntry);
     if (this.auditLog.length > maxEntries) {
       this.auditLog.splice(0, this.auditLog.length - maxEntries);
     }
 
     const telemetryEvent: AuditTelemetryEvent = {
-      ...entry,
-      isoTimestamp: new Date(entry.timestamp).toISOString(),
+      ...sanitizedEntry,
+      isoTimestamp: new Date(sanitizedEntry.timestamp).toISOString(),
       arguments:
-        entry.parsedInput !== undefined ? entry.parsedInput : entry.rawInput,
-      outcome: this.resolveOutcome(entry.status),
-      duration: entry.durationMs,
+        sanitizedEntry.parsedInput !== undefined
+          ? sanitizedEntry.parsedInput
+          : sanitizedEntry.rawInput,
+      outcome: this.resolveOutcome(sanitizedEntry.status),
+      duration: sanitizedEntry.durationMs,
     };
 
     const callbacks: AuditTelemetryCallback[] = [];
@@ -635,7 +767,7 @@ export class ToolRegistry {
           persisted = [];
         }
       }
-      persisted.push(entry);
+      persisted.push(sanitizedEntry);
       if (persisted.length > maxEntries) {
         persisted = persisted.slice(persisted.length - maxEntries);
       }
