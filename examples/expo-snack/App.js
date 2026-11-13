@@ -12,29 +12,16 @@ import {
   createGuardrails,
   AgentApprovalProvider,
   AgentApprovalSheet,
-  useApprovalRequest,
   toVercelAITools,
-  type ApprovalRequest,
-  type AuditTelemetryEvent,
 } from 'react-native-agent-guard';
 
 /**
  * Biometric verification helper with a clean Web / Simulator fallback
  * so the Expo Snack runs seamlessly both in the browser and on physical iOS/Android devices via Expo Go.
  */
-async function verifyBiometricsWithFallback(
-  request: ApprovalRequest,
-): Promise<boolean> {
+async function verifyBiometricsWithFallback(request) {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const LocalAuthentication = require('expo-local-authentication') as {
-      hasHardwareAsync?: () => Promise<boolean>;
-      isEnrolledAsync?: () => Promise<boolean>;
-      authenticateAsync?: (opts: {
-        promptMessage: string;
-        cancelLabel: string;
-      }) => Promise<{ success: boolean }>;
-    };
+    const LocalAuthentication = require('expo-local-authentication');
 
     if (
       Platform.OS !== 'web' &&
@@ -55,7 +42,7 @@ async function verifyBiometricsWithFallback(
           promptMessage: `Biometric Check: ${request.toolName}`,
           cancelLabel: 'Cancel',
         });
-        return Boolean(res?.success);
+        return Boolean(res && res.success);
       }
     }
   } catch {
@@ -137,34 +124,13 @@ const guardrails = createGuardrails({
     }),
   });
 
-/**
- * Child status component using `useApprovalRequest()` directly from `react-native-agent-guard`
- * to display the live FIFO approval queue status.
- */
-function PendingQueueStatus() {
-  const { currentRequest, queueLength } = useApprovalRequest();
-
-  if (!currentRequest) {
-    return null;
-  }
-
-  return (
-    <View style={styles.queueBanner}>
-      <Text style={styles.queueBannerText}>
-        ⏳ Awaiting user approval for `{currentRequest.toolName}` ({queueLength}{' '}
-        in FIFO queue)
-      </Text>
-    </View>
-  );
-}
-
 export default function App() {
-  const [auditFeed, setAuditFeed] = useState<AuditTelemetryEvent[]>([]);
-  const [lastBanner, setLastBanner] = useState<string>(
+  const [auditFeed, setAuditFeed] = useState([]);
+  const [lastBanner, setLastBanner] = useState(
     'Tap any scenario below to test v0.3.2 guardrails.',
   );
-  const [loopCount, setLoopCount] = useState<number>(0);
-  const [showAdapterPreview, setShowAdapterPreview] = useState<boolean>(false);
+  const [loopCount, setLoopCount] = useState(0);
+  const [showAdapterPreview, setShowAdapterPreview] = useState(false);
 
   useEffect(() => {
     return guardrails.onAudit((event) => {
@@ -186,20 +152,17 @@ export default function App() {
     );
   }, []);
 
-  const runPaymentScenario = async (amountUSD: number, label: string) => {
+  const runPaymentScenario = async (amountUSD, label) => {
     setLastBanner(`Running ${label} ($${amountUSD})...`);
-    const res = await guardrails.execute<{ txId: string; amountUSD: number }>(
-      'send_payment',
-      {
-        recipient: 'alice.chen@acme.dev',
-        amountUSD,
-        memo: `Demo transfer (${label})`,
-      },
-    );
+    const res = await guardrails.execute('send_payment', {
+      recipient: 'alice.chen@acme.dev',
+      amountUSD,
+      memo: `Demo transfer (${label})`,
+    });
 
     if (res.success && res.data) {
       setLastBanner(
-        `✅ [${res.policy?.toUpperCase()}] Approved $${res.data.amountUSD} (${res.data.txId}) in ${res.durationMs}ms`,
+        `✅ [${res.policy ? res.policy.toUpperCase() : 'AUTO'}] Approved $${res.data.amountUSD} (${res.data.txId}) in ${res.durationMs}ms`,
       );
     } else {
       setLastBanner(`🛑 Blocked (${res.code}): ${res.llmFeedback}`);
@@ -232,10 +195,7 @@ export default function App() {
   };
 
   const runPIIRedactionScenario = async () => {
-    const res = await guardrails.execute<{
-      synced: boolean;
-      handlerReceivedUnredactedKey: boolean;
-    }>('sync_customer_kyc', {
+    const res = await guardrails.execute('sync_customer_kyc', {
       customerNote:
         'Contact sarah.connor@cyberdyne.io, card 4532 0151 1283 0366, SSN 123-45-6789, tel +1-555-839-2001',
       apiKey: 'Bearer sk_live_secret_99887766',
@@ -270,7 +230,6 @@ export default function App() {
           <View style={styles.statusBanner}>
             <Text style={styles.statusBannerText}>{lastBanner}</Text>
           </View>
-          <PendingQueueStatus />
 
           {/* Section 1: Dynamic Policy Routing */}
           <View style={styles.card}>
@@ -294,7 +253,7 @@ export default function App() {
                 onPress={() => runPaymentScenario(120, 'Standard Transfer')}
               >
                 <Text style={styles.btnLabel}>$120 • Confirm</Text>
-                <Text style={styles.btnSub}>{"$50-$199 -> Sheet"}</Text>
+                <Text style={styles.btnSub}>{'$50-$199 -> Sheet'}</Text>
               </TouchableOpacity>
 
               <TouchableOpacity
@@ -302,7 +261,7 @@ export default function App() {
                 onPress={() => runPaymentScenario(450, 'High-Value Wire')}
               >
                 <Text style={styles.btnLabel}>$450 • Biometric</Text>
-                <Text style={styles.btnSub}>{"$200+ -> FaceID"}</Text>
+                <Text style={styles.btnSub}>{'$200+ -> FaceID'}</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -386,7 +345,7 @@ export default function App() {
                   <View style={styles.auditHeader}>
                     <Text style={styles.auditTool}>{item.toolName}</Text>
                     <Text style={styles.auditBadge}>
-                      {item.policy?.toUpperCase()} →{' '}
+                      {item.policy ? item.policy.toUpperCase() : 'N/A'} →{' '}
                       {item.outcome.toUpperCase()} ({item.duration}ms)
                     </Text>
                   </View>
@@ -459,19 +418,6 @@ const styles = StyleSheet.create({
   statusBannerText: {
     color: '#E2E8F0',
     fontSize: 13,
-    fontWeight: '600',
-  },
-  queueBanner: {
-    backgroundColor: '#1E1B4B',
-    borderColor: '#4338CA',
-    borderWidth: 1,
-    borderRadius: 10,
-    padding: 10,
-    marginBottom: 14,
-  },
-  queueBannerText: {
-    color: '#C7D2FE',
-    fontSize: 12,
     fontWeight: '600',
   },
   card: {

@@ -26,7 +26,6 @@
     "src",
     "__tests__",
     "examples/expo-example/App.tsx",
-    "examples/expo-snack/App.tsx",
     "tsup.config.ts"
   ],
   "exclude": ["node_modules", "dist"]
