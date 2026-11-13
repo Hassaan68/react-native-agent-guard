@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/Hassaan68/react-native-agent-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/Hassaan68/react-native-agent-guard/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/react-native-agent-guard.svg?style=flat-square)](https://www.npmjs.com/package/react-native-agent-guard)
+[![Try it on Expo Snack](https://img.shields.io/badge/Expo_Snack-Try_Live_Demo-000020?style=flat-square&logo=expo&logoColor=white)](https://snack.expo.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](./LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178C6.svg?style=flat-square&logo=typescript&logoColor=white)](./tsconfig.json)
 
@@ -60,6 +61,22 @@ yarn add react-native-agent-guard zod
 ```
 
 > **Peer Dependencies**: Ensure `react` (`>=18.0.0`), `react-native` (`>=0.72.0`), and `zod` (`^4.0.0`) are installed in your React Native project. For native hardware biometrics (`policy: 'biometric'`), install `expo-local-authentication`.
+
+---
+
+## Live Interactive Playground (Expo Snack)
+
+Want to test `react-native-agent-guard` (`v0.3.2`) directly in your browser or on your phone via **Expo Go** in under 30 seconds?
+
+1. Open **[snack.expo.dev](https://snack.expo.dev)**.
+2. Copy the dependencies from **[`examples/expo-snack/package.json`](./examples/expo-snack/package.json)** (`react-native-agent-guard@0.3.2`, `zod`, `expo-local-authentication`).
+3. Paste the single-file interactive dashboard from **[`examples/expo-snack/App.tsx`](./examples/expo-snack/App.tsx)** into `App.tsx`.
+
+The Snack playground lets you interactively test:
+- **Dynamic Policy Routing**: `< $50` (`'auto'`), `$50–$199` (`<AgentApprovalSheet />`), and `$200+` (`'biometric'` with web/simulator fallback).
+- **Agent Loop Protection**: Spam-clicking an `'auto'` tool to trigger automatic policy escalation to `'confirm'` after `maxCallsPerMinute` is exceeded.
+- **Live PII Redaction**: Inspecting real-time `onAudit` telemetry with automatic masking of emails, credit cards, SSNs, phone numbers, and Bearer tokens.
+- **Vercel AI SDK & OpenAI Strict Exports**: Viewing generated `toVercelAITools()` and `toOpenAITools({ strict: true })` schemas.
 
 ---
 

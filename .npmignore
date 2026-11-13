@@ -1,7 +1,8 @@
-# Source & tests
+# Source, examples & tests
 src/
 __tests__/
 __mocks__/
+examples/
 
 # Config & CI
 .github/
