@@ -115,3 +115,9 @@ export function useAgentApproval(): AgentApprovalContextValue {
   }
   return context;
 }
+
+/**
+ * Alias for `useAgentApproval()` returning `{ currentRequest, queueLength, approve, deny }`
+ * from the nearest `<AgentApprovalProvider>`.
+ */
+export const useApprovalRequest = useAgentApproval;

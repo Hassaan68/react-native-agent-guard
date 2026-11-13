@@ -9,9 +9,11 @@ import {
 } from 'react-native';
 import { z } from 'zod';
 import {
+  createGuardrails,
   AgentApprovalProvider,
   AgentApprovalSheet,
-  createGuardrails,
+  useApprovalRequest,
+  toVercelAITools,
   type ApprovalRequest,
   type AuditTelemetryEvent,
 } from 'react-native-agent-guard';
@@ -135,6 +137,27 @@ const guardrails = createGuardrails({
     }),
   });
 
+/**
+ * Child status component using `useApprovalRequest()` directly from `react-native-agent-guard`
+ * to display the live FIFO approval queue status.
+ */
+function PendingQueueStatus() {
+  const { currentRequest, queueLength } = useApprovalRequest();
+
+  if (!currentRequest) {
+    return null;
+  }
+
+  return (
+    <View style={styles.queueBanner}>
+      <Text style={styles.queueBannerText}>
+        ⏳ Awaiting user approval for `{currentRequest.toolName}` ({queueLength}{' '}
+        in FIFO queue)
+      </Text>
+    </View>
+  );
+}
+
 export default function App() {
   const [auditFeed, setAuditFeed] = useState<AuditTelemetryEvent[]>([]);
   const [lastBanner, setLastBanner] = useState<string>(
@@ -151,7 +174,7 @@ export default function App() {
 
   // 4. Vercel AI SDK & Strict OpenAI Tool Exports
   const adapterPreviewJson = useMemo(() => {
-    const vercelTools = guardrails.toVercelAITools({ unwrapData: true });
+    const vercelTools = toVercelAITools(guardrails, { unwrapData: true });
     const strictOpenAI = guardrails.toOpenAITools({ strict: true });
     return JSON.stringify(
       {
@@ -247,6 +270,7 @@ export default function App() {
           <View style={styles.statusBanner}>
             <Text style={styles.statusBannerText}>{lastBanner}</Text>
           </View>
+          <PendingQueueStatus />
 
           {/* Section 1: Dynamic Policy Routing */}
           <View style={styles.card}>
@@ -435,6 +459,19 @@ const styles = StyleSheet.create({
   statusBannerText: {
     color: '#E2E8F0',
     fontSize: 13,
+    fontWeight: '600',
+  },
+  queueBanner: {
+    backgroundColor: '#1E1B4B',
+    borderColor: '#4338CA',
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 14,
+  },
+  queueBannerText: {
+    color: '#C7D2FE',
+    fontSize: 12,
     fontWeight: '600',
   },
   card: {
