@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
   AgentApprovalProvider,
   AgentApprovalSheet,
+  CANONICALIZER_VERSION,
   canonicalizeEnvelope,
   computePayloadHash,
   createBleSyncToolPreset,
@@ -1378,19 +1379,19 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
       const payload1 = {
         zebra: 'last',
         alpha: 'first',
-         omittedUndefined: undefined,
+        omittedUndefined: undefined,
         bigAmount: 9007199254740993n,
         timestamp: date,
         binary: bytes,
         scopes: setA,
         headers: mapA,
-        numbers: [-0, Number.NaN, Number.POSITIVE_INFINITY, undefined],
+        numbers: [-0, 42, undefined],
         nested: { b: 2, a: 1 },
       };
 
       const payload2 = {
         nested: { a: 1, b: 2 },
-        numbers: [0, null, null, null],
+        numbers: [0, 42, null],
         headers: mapB,
         scopes: setB,
         binary: bytes,
@@ -1412,7 +1413,7 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
           ['zKey', 1],
         ],
         nested: { a: 1, b: 2 },
-        numbers: [0, null, null, null],
+        numbers: [0, 42, null],
         scopes: ['alpha', 'beta', 'gamma'],
         timestamp: '2026-05-01T12:30:00.000Z',
         zebra: 'last',
@@ -1429,7 +1430,14 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
         args: payload2,
       });
 
+      expect(CANONICALIZER_VERSION).toBe('jcs-rn-v1');
       expect(env1).toBe(env2);
+      expect(JSON.parse(env1)).toEqual({
+        args: norm1,
+        canonicalizerVersion: 'jcs-rn-v1',
+        schemaVersion: '3',
+        toolName: 'crypto_sign',
+      });
       const hash1 = computePayloadHash(env1);
       const hash2 = computePayloadHash(env2);
       expect(hash1).toBe(hash2);
@@ -1451,7 +1459,13 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
       );
       expect(emojiHash).toMatch(/^[0-9a-f]{64}$/);
 
-      // Rejects Functions, Symbols, Symbol keys, invalid Dates, and circular structures
+      // Rejects NaN, Infinity, Functions, Symbols, Symbol keys, invalid Dates, and circular structures
+      expect(() => normalizeValue({ badNum: Number.NaN })).toThrow(
+        GuardrailCanonicalizationError,
+      );
+      expect(() =>
+        normalizeValue({ badInf: Number.POSITIVE_INFINITY }),
+      ).toThrow(GuardrailCanonicalizationError);
       expect(() => normalizeValue({ fn: () => {} })).toThrow(
         GuardrailCanonicalizationError,
       );
@@ -1551,6 +1565,17 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
       });
       expect(res.biometricAssertion).toBe('secure-enclave-jwt-assertion-v1');
       expect(res.payloadHash).toBe(receivedBioMeta?.payloadHash);
+
+      // Verify AuditLogEntry receipt persists schemaVersion, canonicalizerVersion, payloadHash, and biometricAssertion
+      const [approvedAuditReceipt] = guardrails.getAuditLog();
+      expect(approvedAuditReceipt?.schemaVersion).toBe('2026-11');
+      expect(approvedAuditReceipt?.canonicalizerVersion).toBe('jcs-rn-v1');
+      expect(approvedAuditReceipt?.payloadHash).toBe(
+        receivedBioMeta?.payloadHash,
+      );
+      expect(approvedAuditReceipt?.biometricAssertion).toBe(
+        'secure-enclave-jwt-assertion-v1',
+      );
 
       // Also test when onBiometricAuth returns { verified: false }
       onBiometricAuth.mockResolvedValueOnce({

@@ -9,6 +9,7 @@ import {
 } from './adapters';
 import { authenticateWithExpoBiometrics } from './biometrics';
 import {
+  CANONICALIZER_VERSION,
   canonicalizeEnvelope,
   computePayloadHash,
   deepFreeze,
@@ -534,6 +535,7 @@ export class ToolRegistry {
         canonicalArgs,
         payloadHash: expectedHash,
         schemaVersion: currentSchemaVersion,
+        canonicalizerVersion: CANONICALIZER_VERSION,
         policy: resolvedPolicy,
         status: 'TAMPER_DETECTED',
         durationMs,
@@ -611,6 +613,7 @@ export class ToolRegistry {
         canonicalArgs,
         payloadHash: expectedHash,
         schemaVersion: currentSchemaVersion,
+        canonicalizerVersion: CANONICALIZER_VERSION,
         ...(biometricAssertion !== undefined ? { biometricAssertion } : {}),
         policy: resolvedPolicy,
         status: 'SUCCESS',
@@ -748,6 +751,7 @@ export class ToolRegistry {
       canonicalArgs: params.canonicalArgs,
       payloadHash: params.payloadHash,
       schemaVersion: params.schemaVersion,
+      canonicalizerVersion: CANONICALIZER_VERSION,
       policy: params.policy,
       status: params.code as AuditExecutionStatus,
       durationMs,

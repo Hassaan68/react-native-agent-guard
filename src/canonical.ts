@@ -1,6 +1,13 @@
 /**
+ * Version identifier for the deterministic RFC 8785 (JCS) + React Native extended canonicalizer.
+ * Bound into every canonical envelope (`canonicalizerVersion: 'jcs-rn-v1'`) so backend verifiers
+ * and audit receipts know the exact normalization rules used to produce `payloadHash`.
+ */
+export const CANONICALIZER_VERSION = 'jcs-rn-v1';
+
+/**
  * Error thrown when tool arguments contain non-canonicalizable values
- * such as Functions, Symbols, circular references, or invalid Dates.
+ * such as Functions, Symbols, non-finite numbers (NaN/Infinity), circular references, or invalid Dates.
  */
 export class GuardrailCanonicalizationError extends Error {
   public readonly code = 'CANONICALIZATION_ERROR' as const;
@@ -66,7 +73,9 @@ function normalizeValueInternal(
   if (valueType === 'number') {
     const num = val as number;
     if (!Number.isFinite(num)) {
-      return null;
+      throw new GuardrailCanonicalizationError(
+        'Cannot canonicalize non-finite number (NaN or Infinity) in tool arguments.',
+      );
     }
     return Object.is(num, -0) ? 0 : num;
   }
@@ -207,12 +216,14 @@ export interface CanonicalEnvelopeParams {
 
 /**
  * Produce a deterministic RFC 8785 (JCS) JSON envelope string binding
- * `{ args, schemaVersion, toolName }` for WYSIWYS approval and hardware biometric attestation.
+ * `{ args, canonicalizerVersion, schemaVersion, toolName }` for WYSIWYS approval
+ * and hardware biometric attestation.
  */
 export function canonicalizeEnvelope(params: CanonicalEnvelopeParams): string {
   const normalizedArgs = normalizeValue(params.args);
   const envelope = {
     args: normalizedArgs === undefined ? null : normalizedArgs,
+    canonicalizerVersion: CANONICALIZER_VERSION,
     schemaVersion: params.schemaVersion ?? '1',
     toolName: params.toolName,
   };

@@ -146,7 +146,7 @@ In high-assurance fintech, wallet, enterprise, and healthcare apps, a boolean re
 ### How the v0.4.0 Integrity Pipeline Works
 
 1. **Immediate TOCTOU Deep-Freeze (`deepFreeze`)**: As soon as `inputSchema.safeParseAsync()` succeeds (including any Zod `.default()` and `.transform()` steps), `react-native-agent-guard` recursively freezes `parsedArgs` in-place—locking plain objects, arrays, `Date`, `Map`, `Set`, and TypedArray mutator methods so concurrent code cannot mutate queued arguments while awaiting user confirmation or biometrics.
-2. **RFC 8785 (JCS) Deterministic Canonicalization & WYSIWYS Parity (`normalizeValue` & `canonicalizeEnvelope`)**: Arguments are normalized into a deterministic JSON envelope (`{ args, schemaVersion, toolName }`) with UTF-16 lexicographically sorted keys and safe serialization of `Date` (ISO-8601 UTC), `BigInt` (`"1000n"`), `Uint8Array` (`"uint8:<hex>"`), `Set`, and `Map`. `<AgentApprovalSheet />` renders `request.canonicalArgs` so What-You-See-Is-What-You-Sign (WYSIWYS) matches the exact bytes hashed.
+2. **RFC 8785 (JCS) Deterministic Canonicalization & WYSIWYS Parity (`normalizeValue` & `canonicalizeEnvelope`)**: Arguments are normalized into a deterministic JSON envelope (`{ args, canonicalizerVersion: 'jcs-rn-v1', schemaVersion, toolName }`) with UTF-16 code-unit sorted keys and safe serialization of `Date` (ISO-8601 UTC), `BigInt` (`"1000n"`), `Uint8Array` (`"uint8:<hex>"`), `Set`, and `Map` (while rejecting `NaN`, `Infinity`, functions, and `Symbol`s with `GuardrailCanonicalizationError`). `<AgentApprovalSheet />` renders `request.canonicalArgs` so What-You-See-Is-What-You-Sign (WYSIWYS) matches the exact bytes hashed.
 3. **Cryptographic Biometric Attestation (`onBiometricAuth`)**: A zero-dependency, synchronous SHA-256 digest (`payloadHash`) of the canonical envelope is passed to `onBiometricAuth` so you can sign the digest using iOS Secure Enclave, Android Keystore, or WebAuthn/Passkeys and return `{ verified: true, biometricAssertion }`.
 4. **Pre-Handler SHA-256 Re-Verification (`GuardrailTamperError`)**: Immediately before invoking `tool.handler(args, context)`, the registry recomputes the SHA-256 digest of the envelope. If any argument or `schemaVersion` drifted between approval and execution, execution is aborted with `GuardrailTamperError` and recorded as `TAMPER_DETECTED` in the audit log.
 
@@ -728,6 +728,10 @@ Every tool execution lifecycle event—including `auto` executions, user modal a
 | `isoTimestamp` | `string` | ISO-8601 formatted timestamp string |
 | `toolName` | `string` | Name of the invoked tool |
 | `arguments` | `unknown` | Validated tool arguments (`parsedInput` or fallback `rawInput`) |
+| `schemaVersion` | `string` | Tool schema version bound into `payloadHash` (defaults to `'1'`) |
+| `canonicalizerVersion` | `string` | Canonicalizer algorithm version bound into `payloadHash` (`'jcs-rn-v1'`) |
+| `payloadHash` | `string` | 64-character lowercase hex SHA-256 digest of the canonical envelope |
+| `biometricAssertion` | `string \| Record<string, unknown>` | Cryptographic biometric assertion returned by `onBiometricAuth` / `onBiometricRequired` |
 | `policy` | `'auto' \| 'confirm' \| 'biometric' \| 'deny'` | Resolved guardrail policy |
 | `outcome` | `'approved' \| 'denied' \| 'failed'` | High-level governance outcome |
 | `status` | `AuditExecutionStatus` | Granular status (`SUCCESS`, `USER_DENIED`, `BIOMETRIC_FAILED`, `DENIED_BY_POLICY`, `VALIDATION_ERROR`, `TIMEOUT_ERROR`, `EXECUTION_ERROR`) |
@@ -789,8 +793,9 @@ In addition to `createGuardrails`, `createToolRegistry`, `<AgentApprovalProvider
 
 | Export | Signature / Type | Description |
 | :--- | :--- | :--- |
-| `normalizeValue(val)` | `(val: unknown) => unknown` | Recursively normalizes values for RFC 8785 (JCS) and WYSIWYS parity: sorts object keys lexicographically by UTF-16 code units, omits `undefined` properties, converts `Date` to ISO-8601 UTC strings, `BigInt` to `"${val}n"`, `Uint8Array` to `"uint8:<hex>"`, deterministically sorts `Set` and `Map` entries, and rejects functions/Symbols with `GuardrailCanonicalizationError`. |
-| `canonicalizeEnvelope(params)` | `({ toolName, schemaVersion?, args }) => string` | Returns the deterministic JSON envelope string `{"args":...,"schemaVersion":"1","toolName":"..."}` used for signing and digest verification. |
+| `CANONICALIZER_VERSION` | `'jcs-rn-v1'` | Constant identifying the RFC 8785 (JCS) + React Native canonicalization algorithm version bound into every canonical envelope and audit log entry. |
+| `normalizeValue(val)` | `(val: unknown) => unknown` | Recursively normalizes values for RFC 8785 (JCS) and WYSIWYS parity: sorts object keys lexicographically by UTF-16 code units, omits `undefined` properties, converts `Date` to ISO-8601 UTC strings, `BigInt` to `"${val}n"`, `Uint8Array` to `"uint8:<hex>"`, deterministically sorts `Set` and `Map` entries, and rejects `NaN`, `Infinity`, functions, and Symbols with `GuardrailCanonicalizationError`. |
+| `canonicalizeEnvelope(params)` | `({ toolName, schemaVersion?, args }) => string` | Returns the deterministic JSON envelope string `{"args":...,"canonicalizerVersion":"jcs-rn-v1","schemaVersion":"1","toolName":"..."}` used for signing and digest verification. |
 | `computePayloadHash(envelope)` | `(envelopeString: string) => string` | Synchronous, zero-dependency SHA-256 implementation returning a 64-character lowercase hex digest across React Native (Hermes), Expo Snack Web, and Node/Jest. |
 | `deepFreeze(obj)` | `<T>(obj: T) => Readonly<T>` | Recursively freezes objects, arrays, `Date`, `Map`, `Set`, and TypedArray instances in-place (locking mutator methods) to prevent TOCTOU mutations. |
 | `GuardrailTamperError` | `class extends Error` | Thrown before handler execution when pre-handler SHA-256 digest re-verification detects argument or `schemaVersion` drift (`code: 'TAMPER_DETECTED'`). |

@@ -257,6 +257,8 @@ export interface AuditLogEntry {
   payloadHash?: string;
   /** Schema version bound into `payloadHash`. */
   schemaVersion?: string;
+  /** Canonicalizer algorithm version bound into `payloadHash` (e.g. `'jcs-rn-v1'`). */
+  canonicalizerVersion?: string;
   /** Optional hardware-backed biometric assertion returned by `onBiometricAuth` / `onBiometricRequired`. */
   biometricAssertion?: string | Record<string, unknown>;
   /** Policy evaluated for this execution (if validation succeeded). */
