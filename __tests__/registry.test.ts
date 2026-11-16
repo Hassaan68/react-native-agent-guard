@@ -14,15 +14,20 @@ import {
   createToolRegistry,
   deepFreeze,
   GENESIS_AUDIT_HASH,
+  getCanonicalizerCodec,
   GuardrailCanonicalizationError,
   GuardrailTamperError,
   GuardrailThreatError,
   GuardrailTimeoutError,
+  GuardrailUnknownCodecError,
+  JCS_RN_V1_TEST_VECTORS,
   normalizeValue,
+  registerCanonicalizerCodec,
   scanArgumentsForThreats,
   toLangChainTools,
   toVercelAITools,
   verifyAuditChain,
+  verifyReceipt,
   zodToClaudeSchema,
   zodToOpenAISchema,
   type ApprovalResolution,
@@ -2121,6 +2126,165 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
           ]),
         }),
       );
+    });
+  });
+
+  describe('21. Fail-Closed Canonicalizer Codec Registry & Golden Test Vectors', () => {
+    it('verifies built-in jcs-rn-v1 golden test vectors and validates live receipts via verifyReceipt()', () => {
+      expect(JCS_RN_V1_TEST_VECTORS.length).toBeGreaterThanOrEqual(3);
+      const codec = getCanonicalizerCodec('jcs-rn-v1');
+      expect(codec.version).toBe('jcs-rn-v1');
+
+      for (const vector of JCS_RN_V1_TEST_VECTORS) {
+        const canonical = codec.canonicalizeEnvelope(vector.envelope);
+        expect(canonical).toBe(vector.expectedCanonical);
+        expect(computePayloadHash(canonical)).toBe(vector.expectedHash);
+
+        const receiptCheck = verifyReceipt({
+          toolName: vector.envelope.toolName,
+          schemaVersion: vector.envelope.schemaVersion,
+          canonicalizerVersion: 'jcs-rn-v1',
+          args: vector.envelope.args,
+          payloadHash: vector.expectedHash,
+        });
+        expect(receiptCheck).toEqual({
+          valid: true,
+          recomputedHash: vector.expectedHash,
+        });
+      }
+
+      // Mismatched hash fails verifyReceipt
+      const badHashCheck = verifyReceipt({
+        toolName: 'send_payment',
+        schemaVersion: '1',
+        canonicalizerVersion: 'jcs-rn-v1',
+        args: { alpha: 100, flag: true, zebra: 'last' },
+        payloadHash: '0'.repeat(64),
+      });
+      expect(badHashCheck.valid).toBe(false);
+      expect(badHashCheck.reason).toContain('Payload hash mismatch');
+    });
+
+    it('fails closed in getCanonicalizerCodec, verifyReceipt, and verifyAuditChain when given an unknown canonicalizerVersion', async () => {
+      expect(() => getCanonicalizerCodec('jcs-rn-v99')).toThrow(
+        GuardrailUnknownCodecError,
+      );
+
+      const unknownReceiptCheck = verifyReceipt({
+        toolName: 'send_payment',
+        schemaVersion: '1',
+        canonicalizerVersion: 'jcs-rn-v99',
+        args: { amount: 50 },
+        payloadHash: 'a'.repeat(64),
+      });
+      expect(unknownReceiptCheck).toEqual({
+        valid: false,
+        reason: 'Unsupported canonicalizerVersion: jcs-rn-v99',
+      });
+
+      const guardrails = createGuardrails().register('ping', {
+        description: 'Ping tool',
+        inputSchema: z.object({}),
+        policy: 'auto',
+        handler: () => ({ ok: true }),
+      });
+
+      await guardrails.execute('ping', {});
+      const logs = guardrails.getAuditLog();
+      const logsWithUnknownCodec = logs.map((entry) => ({
+        ...entry,
+        canonicalizerVersion: 'jcs-rn-v99',
+      }));
+
+      const chainCheck = verifyAuditChain(logsWithUnknownCodec);
+      expect(chainCheck).toEqual({
+        valid: false,
+        brokenAtIndex: 0,
+        reason: 'Unsupported canonicalizerVersion: jcs-rn-v99',
+      });
+    });
+
+    it('registers a custom/legacy codec (jcs-rn-v0-legacy) with valid golden vectors and rejects codecs that fail self-test or overwrite existing versions', () => {
+      const legacyCanonicalize = (input: {
+        toolName: string;
+        schemaVersion?: string;
+        args: unknown;
+      }) =>
+        JSON.stringify({
+          v: 'jcs-rn-v0-legacy',
+          tool: input.toolName,
+          schema: input.schemaVersion ?? '1',
+          args: normalizeValue(input.args),
+        });
+
+      const legacySampleCanonical = legacyCanonicalize({
+        toolName: 'legacy_transfer',
+        schemaVersion: '1',
+        args: { b: 2, a: 1 },
+      });
+      const legacySampleHash = computePayloadHash(legacySampleCanonical);
+
+      registerCanonicalizerCodec({
+        version: 'jcs-rn-v0-legacy',
+        normalizeValue,
+        canonicalizeEnvelope: legacyCanonicalize,
+        testVectors: [
+          {
+            name: 'legacy_vector_1',
+            envelope: {
+              toolName: 'legacy_transfer',
+              schemaVersion: '1',
+              args: { b: 2, a: 1 },
+            },
+            expectedCanonical: legacySampleCanonical,
+            expectedHash: legacySampleHash,
+          },
+        ],
+      });
+
+      // Verify receipt signed under jcs-rn-v0-legacy now succeeds
+      const legacyReceiptCheck = verifyReceipt({
+        toolName: 'legacy_transfer',
+        schemaVersion: '1',
+        canonicalizerVersion: 'jcs-rn-v0-legacy',
+        args: { a: 1, b: 2 },
+        payloadHash: legacySampleHash,
+      });
+      expect(legacyReceiptCheck).toEqual({
+        valid: true,
+        recomputedHash: legacySampleHash,
+      });
+
+      // Prevent overwriting an already-registered version with a different codec object
+      expect(() =>
+        registerCanonicalizerCodec({
+          version: 'jcs-rn-v0-legacy',
+          normalizeValue,
+          canonicalizeEnvelope: legacyCanonicalize,
+          testVectors: [],
+        }),
+      ).toThrow(/already registered/i);
+
+      // Reject codec whose implementation mismatches its golden testVectors
+      expect(() =>
+        registerCanonicalizerCodec({
+          version: 'jcs-rn-broken-codec',
+          normalizeValue,
+          canonicalizeEnvelope: () => '{"broken":true}',
+          testVectors: [
+            {
+              name: 'broken_vector_check',
+              envelope: {
+                toolName: 'test',
+                schemaVersion: '1',
+                args: {},
+              },
+              expectedCanonical: '{"expected":true}',
+              expectedHash: '0'.repeat(64),
+            },
+          ],
+        }),
+      ).toThrow(/Codec self-test failed for vector: broken_vector_check/);
     });
   });
 });

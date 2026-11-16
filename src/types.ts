@@ -1,7 +1,13 @@
 import type { z } from 'zod';
 import type { BiometricAuthOptions } from './biometrics';
+import type {
+  CanonicalizerCodec,
+  CanonicalizerTestVector,
+} from './canonical';
 import type { PIIRedactionOption } from './redaction';
 import type { ThreatDetection, ThreatScannerOption } from './threatScanner';
+
+export type { CanonicalizerCodec, CanonicalizerTestVector };
 
 /**
  * Single field-level before/after diff entry returned by a tool's `preview(args)` generator.

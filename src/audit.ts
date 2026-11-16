@@ -2,6 +2,7 @@ import {
   CANONICALIZER_VERSION,
   canonicalizeValue,
   computePayloadHash,
+  getCanonicalizerCodec,
 } from './canonical';
 import type { AuditLogEntry } from './types';
 
@@ -43,6 +44,18 @@ export function verifyAuditChain(
     const entry = logs[i];
     if (!entry) {
       continue;
+    }
+
+    if (entry.canonicalizerVersion !== undefined) {
+      try {
+        getCanonicalizerCodec(entry.canonicalizerVersion);
+      } catch {
+        return {
+          valid: false,
+          brokenAtIndex: i,
+          reason: `Unsupported canonicalizerVersion: ${entry.canonicalizerVersion}`,
+        };
+      }
     }
 
     if (entry.prevHash !== expectedPrevHash) {

@@ -56,6 +56,50 @@ export class GuardrailTimeoutError extends Error {
 }
 
 /**
+ * Error thrown when an unknown or unregistered `canonicalizerVersion` is requested from the codec registry.
+ */
+export class GuardrailUnknownCodecError extends Error {
+  public readonly code = 'UNKNOWN_CODEC_ERROR' as const;
+  public readonly version: string;
+
+  constructor(version: string, message?: string) {
+    super(message ?? `Unsupported canonicalizerVersion: ${version}`);
+    this.name = 'GuardrailUnknownCodecError';
+    this.version = version;
+    Object.setPrototypeOf(this, GuardrailUnknownCodecError.prototype);
+  }
+}
+
+/**
+ * Golden test vector asserting deterministic canonicalization and SHA-256 hashing for a `CanonicalizerCodec`.
+ */
+export interface CanonicalizerTestVector {
+  name: string;
+  envelope: {
+    toolName: string;
+    schemaVersion: string;
+    args: unknown;
+  };
+  expectedCanonical: string;
+  expectedHash: string;
+}
+
+/**
+ * Versioned canonicalizer codec specification registered in the fail-closed codec registry.
+ */
+export interface CanonicalizerCodec {
+  version: string;
+  normalizeValue: (val: unknown) => unknown;
+  canonicalizeEnvelope: (input: {
+    toolName: string;
+    schemaVersion?: string;
+    args: unknown;
+    canonicalizerVersion?: string;
+  }) => string;
+  testVectors: CanonicalizerTestVector[];
+}
+
+/**
  * Compare two strings lexicographically by UTF-16 code units (RFC 8785 / JCS standard).
  */
 function compareUTF16CodeUnits(a: string, b: string): number {
@@ -235,6 +279,7 @@ export interface CanonicalEnvelopeParams {
   toolName: string;
   schemaVersion?: string;
   args: unknown;
+  canonicalizerVersion?: string;
 }
 
 /**
@@ -246,7 +291,7 @@ export function canonicalizeEnvelope(params: CanonicalEnvelopeParams): string {
   const normalizedArgs = normalizeValue(params.args);
   const envelope = {
     args: normalizedArgs === undefined ? null : normalizedArgs,
-    canonicalizerVersion: CANONICALIZER_VERSION,
+    canonicalizerVersion: params.canonicalizerVersion ?? CANONICALIZER_VERSION,
     schemaVersion: params.schemaVersion ?? '1',
     toolName: params.toolName,
   };
@@ -507,3 +552,179 @@ function deepFreezeInternal<T>(obj: T, seen: WeakSet<object>): Readonly<T> {
 export function deepFreeze<T>(obj: T): Readonly<T> {
   return deepFreezeInternal(obj, new WeakSet<object>());
 }
+
+/**
+ * Built-in golden test vectors for the `'jcs-rn-v1'` canonicalizer codec.
+ */
+export const JCS_RN_V1_TEST_VECTORS: CanonicalizerTestVector[] = [
+  {
+    name: 'utf16_key_sorting_and_primitives',
+    envelope: {
+      toolName: 'send_payment',
+      schemaVersion: '1',
+      args: {
+        zebra: 'last',
+        alpha: 100,
+        omitted: undefined,
+        flag: true,
+      },
+    },
+    expectedCanonical:
+      '{"args":{"alpha":100,"flag":true,"zebra":"last"},"canonicalizerVersion":"jcs-rn-v1","schemaVersion":"1","toolName":"send_payment"}',
+    expectedHash:
+      'd52812ab97736cfb1c35524ffe8fbc07f9684508992bb5772f64c258b1cb26e9',
+  },
+  {
+    name: 'date_utc_iso_and_bigint_tagged',
+    envelope: {
+      toolName: 'sign_tx',
+      schemaVersion: '2.0',
+      args: {
+        deadline: new Date('2026-01-15T08:30:00.000Z'),
+        amountWei: 5000000000000000000n,
+      },
+    },
+    expectedCanonical:
+      '{"args":{"amountWei":"5000000000000000000n","deadline":"2026-01-15T08:30:00.000Z"},"canonicalizerVersion":"jcs-rn-v1","schemaVersion":"2.0","toolName":"sign_tx"}',
+    expectedHash:
+      '836f74cbc8d98c322e0a111f7435bddcff742b0f047b2c8d325d899eb0b3f708',
+  },
+  {
+    name: 'map_set_and_uint8array',
+    envelope: {
+      toolName: 'sync_ble',
+      schemaVersion: '1',
+      args: {
+        payload: new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+        scopes: new Set(['write', 'read']),
+        meta: new Map([
+          ['z', 1],
+          ['a', 2],
+        ]),
+      },
+    },
+    expectedCanonical:
+      '{"args":{"meta":[["a",2],["z",1]],"payload":"uint8:deadbeef","scopes":["read","write"]},"canonicalizerVersion":"jcs-rn-v1","schemaVersion":"1","toolName":"sync_ble"}',
+    expectedHash:
+      'f62a95482dc23398b0f5b68618b803c86db92f4613e44f782b830b16f167e4f3',
+  },
+];
+
+const codecRegistry = new Map<string, CanonicalizerCodec>();
+
+/**
+ * Register a versioned `CanonicalizerCodec` after running self-verification against all of its `testVectors`.
+ * Throws `GuardrailCanonicalizationError` if any golden test vector fails or if attempting to overwrite an existing version with a different codec.
+ */
+export function registerCanonicalizerCodec(codec: CanonicalizerCodec): void {
+  if (!codec || !codec.version || typeof codec.version !== 'string') {
+    throw new GuardrailCanonicalizationError(
+      'CanonicalizerCodec must specify a non-empty version string.',
+    );
+  }
+
+  const existing = codecRegistry.get(codec.version);
+  if (existing) {
+    if (existing === codec) {
+      return;
+    }
+    throw new GuardrailCanonicalizationError(
+      `Canonicalizer codec version "${codec.version}" is already registered and cannot be overwritten.`,
+    );
+  }
+
+  for (const vector of codec.testVectors) {
+    let actualCanonical: string;
+    try {
+      actualCanonical = codec.canonicalizeEnvelope(vector.envelope);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new GuardrailCanonicalizationError(
+        `Codec self-test failed for vector: ${vector.name} (${msg})`,
+      );
+    }
+
+    if (actualCanonical !== vector.expectedCanonical) {
+      throw new GuardrailCanonicalizationError(
+        `Codec self-test failed for vector: ${vector.name} (expected canonical "${vector.expectedCanonical}", got "${actualCanonical}")`,
+      );
+    }
+
+    const actualHash = computePayloadHash(actualCanonical);
+    if (actualHash !== vector.expectedHash) {
+      throw new GuardrailCanonicalizationError(
+        `Codec self-test failed for vector: ${vector.name} (expected hash "${vector.expectedHash}", got "${actualHash}")`,
+      );
+    }
+  }
+
+  codecRegistry.set(codec.version, codec);
+}
+
+/**
+ * Retrieve a registered `CanonicalizerCodec` by version string.
+ * Fails closed by throwing `GuardrailUnknownCodecError` if `version` is not registered.
+ */
+export function getCanonicalizerCodec(version: string): CanonicalizerCodec {
+  const codec = codecRegistry.get(version);
+  if (!codec) {
+    throw new GuardrailUnknownCodecError(version);
+  }
+  return codec;
+}
+
+/**
+ * Verify a signed execution or audit receipt against its declared `canonicalizerVersion` and `payloadHash`.
+ * Fails closed if `canonicalizerVersion` is unknown or if the recomputed SHA-256 digest does not match `payloadHash`.
+ */
+export function verifyReceipt(receipt: {
+  toolName: string;
+  schemaVersion: string;
+  canonicalizerVersion: string;
+  args: unknown;
+  payloadHash: string;
+}): { valid: boolean; reason?: string; recomputedHash?: string } {
+  let codec: CanonicalizerCodec;
+  try {
+    codec = getCanonicalizerCodec(receipt.canonicalizerVersion);
+  } catch {
+    return {
+      valid: false,
+      reason: `Unsupported canonicalizerVersion: ${receipt.canonicalizerVersion}`,
+    };
+  }
+
+  try {
+    const canonicalEnvelope = codec.canonicalizeEnvelope({
+      toolName: receipt.toolName,
+      schemaVersion: receipt.schemaVersion,
+      args: receipt.args,
+      canonicalizerVersion: receipt.canonicalizerVersion,
+    });
+    const recomputedHash = computePayloadHash(canonicalEnvelope);
+    if (recomputedHash !== receipt.payloadHash) {
+      return {
+        valid: false,
+        reason: `Payload hash mismatch: expected "${recomputedHash}", received "${receipt.payloadHash}".`,
+        recomputedHash,
+      };
+    }
+    return { valid: true, recomputedHash };
+  } catch (err) {
+    return {
+      valid: false,
+      reason:
+        err instanceof Error
+          ? err.message
+          : 'Failed to canonicalize receipt arguments.',
+    };
+  }
+}
+
+// Pre-populate the built-in 'jcs-rn-v1' codec and run golden vector self-tests at initialization
+registerCanonicalizerCodec({
+  version: CANONICALIZER_VERSION,
+  normalizeValue,
+  canonicalizeEnvelope,
+  testVectors: JCS_RN_V1_TEST_VECTORS,
+});
