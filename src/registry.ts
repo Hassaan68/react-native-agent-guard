@@ -9,6 +9,14 @@ import {
 } from './adapters';
 import { authenticateWithExpoBiometrics } from './biometrics';
 import {
+  canonicalizeEnvelope,
+  computePayloadHash,
+  deepFreeze,
+  GuardrailCanonicalizationError,
+  GuardrailTamperError,
+  normalizeValue,
+} from './canonical';
+import {
   MCPSSETransportAdapter,
   type MCPSSETransportOptions,
   type MCPToolDescriptor,
@@ -28,6 +36,7 @@ import type {
   AuditOutcome,
   AuditTelemetryCallback,
   AuditTelemetryEvent,
+  BiometricAuthRequest,
   BiometricHandler,
   ClaudeToolSchema,
   MCPToolSchema,
@@ -35,6 +44,7 @@ import type {
   RateLimitConfig,
   RateLimitExceededAction,
   ToolDefinition,
+  ToolExecutionContext,
   ToolExecutionErrorCode,
   ToolExecutionResult,
   ToolPolicy,
@@ -267,7 +277,34 @@ export class ToolRegistry {
       });
     }
 
-    const parsedInput = parseResult.data;
+    const parsedInput = deepFreeze(parseResult.data);
+    const initialSchemaVersion = tool.schemaVersion ?? '1';
+
+    let canonicalArgs: unknown;
+    let expectedHash: string;
+    try {
+      canonicalArgs = normalizeValue(parsedInput);
+      const envelope = canonicalizeEnvelope({
+        toolName,
+        schemaVersion: initialSchemaVersion,
+        args: parsedInput,
+      });
+      expectedHash = computePayloadHash(envelope);
+    } catch (err) {
+      if (err instanceof GuardrailCanonicalizationError) {
+        const errMsg = err.message;
+        return this.finalizeFailure<TOutput>({
+          startTime,
+          toolName,
+          rawInput,
+          parsedInput,
+          code: 'VALIDATION_ERROR',
+          message: `Canonicalization failed for tool "${toolName}": ${errMsg}`,
+          llmFeedback: `Tool "${toolName}" arguments could not be canonicalized: ${errMsg}.`,
+        });
+      }
+      throw err;
+    }
 
     // 3. Evaluate static or dynamic policy
     let resolvedPolicy: ToolPolicy;
@@ -286,6 +323,9 @@ export class ToolRegistry {
         toolName,
         rawInput,
         parsedInput,
+        canonicalArgs,
+        payloadHash: expectedHash,
+        schemaVersion: initialSchemaVersion,
         code: 'DENIED_BY_POLICY',
         message: `Policy evaluation failed for tool "${toolName}": ${errMsg}`,
         llmFeedback: `Tool "${toolName}" could not be executed because policy evaluation failed: ${errMsg}.`,
@@ -299,6 +339,9 @@ export class ToolRegistry {
         toolName,
         rawInput,
         parsedInput,
+        canonicalArgs,
+        payloadHash: expectedHash,
+        schemaVersion: initialSchemaVersion,
         policy: resolvedPolicy,
         code: 'DENIED_BY_POLICY',
         message,
@@ -318,6 +361,9 @@ export class ToolRegistry {
           toolName,
           rawInput,
           parsedInput,
+          canonicalArgs,
+          payloadHash: expectedHash,
+          schemaVersion: initialSchemaVersion,
           policy: resolvedPolicy,
           code: 'RATE_LIMITED',
           message,
@@ -339,6 +385,9 @@ export class ToolRegistry {
           toolName,
           rawInput,
           parsedInput,
+          canonicalArgs,
+          payloadHash: expectedHash,
+          schemaVersion: initialSchemaVersion,
           policy: resolvedPolicy,
           code: 'USER_DENIED',
           message,
@@ -351,6 +400,10 @@ export class ToolRegistry {
         toolName,
         description: tool.description,
         input: parsedInput,
+        args: parsedInput,
+        canonicalArgs,
+        payloadHash: expectedHash,
+        schemaVersion: initialSchemaVersion,
         policy: 'confirm',
         timestamp: Date.now(),
       };
@@ -369,6 +422,9 @@ export class ToolRegistry {
           toolName,
           rawInput,
           parsedInput,
+          canonicalArgs,
+          payloadHash: expectedHash,
+          schemaVersion: initialSchemaVersion,
           policy: resolvedPolicy,
           code: 'USER_DENIED',
           message,
@@ -376,6 +432,8 @@ export class ToolRegistry {
         });
       }
     }
+
+    let biometricAssertion: string | Record<string, unknown> | undefined;
 
     if (resolvedPolicy === 'biometric') {
       const biometricHandler =
@@ -389,13 +447,46 @@ export class ToolRegistry {
         toolName,
         description: tool.description,
         input: parsedInput,
+        args: parsedInput,
+        canonicalArgs,
+        payloadHash: expectedHash,
+        schemaVersion: initialSchemaVersion,
         policy: 'biometric',
         timestamp: Date.now(),
       };
 
+      const biometricMeta: BiometricAuthRequest = {
+        toolName,
+        args: parsedInput,
+        canonicalArgs,
+        payloadHash: expectedHash,
+        schemaVersion: initialSchemaVersion,
+        request,
+      };
+
       let verified = false;
       try {
-        verified = await biometricHandler(request);
+        const rawBioResult =
+          !this.providerBiometricHandler && this.options.onBiometricAuth
+            ? await this.options.onBiometricAuth(
+                toolName,
+                parsedInput,
+                biometricMeta,
+              )
+            : await biometricHandler(request, parsedInput, biometricMeta);
+
+        if (typeof rawBioResult === 'boolean') {
+          verified = rawBioResult;
+        } else if (
+          typeof rawBioResult === 'object' &&
+          rawBioResult !== null &&
+          'verified' in rawBioResult
+        ) {
+          verified = Boolean(rawBioResult.verified);
+          if (verified && rawBioResult.biometricAssertion !== undefined) {
+            biometricAssertion = rawBioResult.biometricAssertion;
+          }
+        }
       } catch {
         verified = false;
       }
@@ -407,6 +498,9 @@ export class ToolRegistry {
           toolName,
           rawInput,
           parsedInput,
+          canonicalArgs,
+          payloadHash: expectedHash,
+          schemaVersion: initialSchemaVersion,
           policy: resolvedPolicy,
           code: 'BIOMETRIC_FAILED',
           message,
@@ -415,7 +509,40 @@ export class ToolRegistry {
       }
     }
 
-    // 4. Execute handler with race-condition-free timeout enforcement
+    // 4. Pre-Handler TOCTOU Digest Re-Verification
+    const currentSchemaVersion = tool.schemaVersion ?? '1';
+    const recomputedHash = computePayloadHash(
+      canonicalizeEnvelope({
+        toolName,
+        schemaVersion: currentSchemaVersion,
+        args: parsedInput,
+      }),
+    );
+
+    if (recomputedHash !== expectedHash) {
+      const tamperError = new GuardrailTamperError(
+        'TOCTOU integrity check failed: tool arguments or schema version drifted before handler execution',
+        { expectedHash, actualHash: recomputedHash },
+      );
+      const durationMs = Math.max(0, Date.now() - startTime);
+      await this.recordAudit({
+        id: generateId('audit'),
+        timestamp: startTime,
+        toolName,
+        rawInput,
+        parsedInput,
+        canonicalArgs,
+        payloadHash: expectedHash,
+        schemaVersion: currentSchemaVersion,
+        policy: resolvedPolicy,
+        status: 'TAMPER_DETECTED',
+        durationMs,
+        errorMessage: tamperError.message,
+      });
+      throw tamperError;
+    }
+
+    // 5. Execute handler with race-condition-free timeout enforcement
     const timeoutMs =
       tool.timeoutMs ?? this.options.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
 
@@ -428,12 +555,21 @@ export class ToolRegistry {
       ? redactPIIValue(parsedInput, this.options.redactPII)
       : parsedInput;
 
+    const executionContext: ToolExecutionContext = {
+      toolName,
+      schemaVersion: currentSchemaVersion,
+      payloadHash: expectedHash,
+      canonicalArgs,
+      policy: resolvedPolicy,
+      ...(biometricAssertion !== undefined ? { biometricAssertion } : {}),
+    };
+
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const timeoutSymbol = Symbol('TIMEOUT');
 
     try {
       const executionPromise = Promise.resolve().then(() =>
-        tool.handler(handlerInput),
+        tool.handler(handlerInput, executionContext),
       );
 
       const raceResult =
@@ -455,6 +591,9 @@ export class ToolRegistry {
           toolName,
           rawInput,
           parsedInput,
+          canonicalArgs,
+          payloadHash: expectedHash,
+          schemaVersion: currentSchemaVersion,
           policy: resolvedPolicy,
           code: 'TIMEOUT_ERROR',
           message,
@@ -469,6 +608,10 @@ export class ToolRegistry {
         toolName,
         rawInput,
         parsedInput,
+        canonicalArgs,
+        payloadHash: expectedHash,
+        schemaVersion: currentSchemaVersion,
+        ...(biometricAssertion !== undefined ? { biometricAssertion } : {}),
         policy: resolvedPolicy,
         status: 'SUCCESS',
         durationMs,
@@ -480,6 +623,8 @@ export class ToolRegistry {
         toolName,
         data: raceResult as TOutput,
         policy: resolvedPolicy,
+        payloadHash: expectedHash,
+        ...(biometricAssertion !== undefined ? { biometricAssertion } : {}),
         durationMs,
       };
     } catch (err) {
@@ -491,6 +636,9 @@ export class ToolRegistry {
         toolName,
         rawInput,
         parsedInput,
+        canonicalArgs,
+        payloadHash: expectedHash,
+        schemaVersion: currentSchemaVersion,
         policy: resolvedPolicy,
         code: 'EXECUTION_ERROR',
         message,
@@ -580,6 +728,9 @@ export class ToolRegistry {
     toolName: string;
     rawInput: unknown;
     parsedInput?: unknown;
+    canonicalArgs?: unknown;
+    payloadHash?: string;
+    schemaVersion?: string;
     policy?: ToolPolicy;
     code: ToolExecutionErrorCode;
     message: string;
@@ -594,6 +745,9 @@ export class ToolRegistry {
       toolName: params.toolName,
       rawInput: params.rawInput,
       parsedInput: params.parsedInput,
+      canonicalArgs: params.canonicalArgs,
+      payloadHash: params.payloadHash,
+      schemaVersion: params.schemaVersion,
       policy: params.policy,
       status: params.code as AuditExecutionStatus,
       durationMs,
@@ -611,6 +765,7 @@ export class ToolRegistry {
       },
       llmFeedback: params.llmFeedback,
       ...(params.policy ? { policy: params.policy } : {}),
+      ...(params.payloadHash ? { payloadHash: params.payloadHash } : {}),
       durationMs,
     };
   }
@@ -705,6 +860,9 @@ export class ToolRegistry {
           ...(entry.parsedInput !== undefined
             ? { parsedInput: redactPIIValue(entry.parsedInput, piiOption) }
             : {}),
+          ...(entry.canonicalArgs !== undefined
+            ? { canonicalArgs: redactPIIValue(entry.canonicalArgs, piiOption) }
+            : {}),
           ...(entry.output !== undefined
             ? { output: redactPIIValue(entry.output, piiOption) }
             : {}),
@@ -771,7 +929,12 @@ export class ToolRegistry {
       if (persisted.length > maxEntries) {
         persisted = persisted.slice(persisted.length - maxEntries);
       }
-      await storage.setItem(key, JSON.stringify(persisted));
+      await storage.setItem(
+        key,
+        JSON.stringify(persisted, (_k, v) =>
+          typeof v === 'bigint' ? `${v.toString()}n` : v,
+        ),
+      );
     } catch {
       // Never allow storage adapter errors to crash tool execution
     }

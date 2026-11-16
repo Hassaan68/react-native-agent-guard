@@ -9,6 +9,7 @@ import type {
 } from './types';
 
 export * from './types';
+export * from './canonical';
 export * from './biometrics';
 export * from './redaction';
 export * from './mcp';
@@ -122,6 +123,12 @@ export class GuardrailRegistry extends ToolRegistry {
     const originalPolicy = definition.policy;
     const wrappedDefinition: ToolDefinition<TSchema, TOutput> = {
       ...definition,
+      get schemaVersion() {
+        return definition.schemaVersion;
+      },
+      set schemaVersion(val: string | undefined) {
+        definition.schemaVersion = val;
+      },
       policy: async (parsedInput: z.infer<TSchema>): Promise<ToolPolicy> => {
         const {
           blockedTools,

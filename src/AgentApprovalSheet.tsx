@@ -12,6 +12,7 @@ import {
   type ViewStyle,
 } from 'react-native';
 import { useAgentApproval } from './ApprovalContext';
+import { normalizeValue } from './canonical';
 
 /**
  * Theme color tokens for `<AgentApprovalSheet />`.
@@ -163,11 +164,25 @@ export const AgentApprovalSheet: React.FC<AgentApprovalSheetProps> = ({
     return null;
   }
 
+  const rawPreviewSource =
+    currentRequest.canonicalArgs ??
+    currentRequest.args ??
+    currentRequest.input ??
+    {};
+
   let formattedArgs = '{}';
   try {
-    formattedArgs = JSON.stringify(currentRequest.input ?? {}, null, 2);
+    const normalizedPreview =
+      currentRequest.canonicalArgs !== undefined
+        ? currentRequest.canonicalArgs
+        : normalizeValue(rawPreviewSource);
+    formattedArgs = JSON.stringify(normalizedPreview ?? {}, null, 2);
   } catch {
-    formattedArgs = String(currentRequest.input);
+    try {
+      formattedArgs = JSON.stringify(rawPreviewSource, null, 2);
+    } catch {
+      formattedArgs = String(rawPreviewSource);
+    }
   }
 
   return (

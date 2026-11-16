@@ -12,6 +12,61 @@ import type { PIIRedactionOption } from './redaction';
 export type ToolPolicy = 'auto' | 'confirm' | 'biometric' | 'deny';
 
 /**
+ * Alias for `ToolPolicy`.
+ */
+export type GuardrailPolicy = ToolPolicy;
+
+/**
+ * Result returned by a biometric handler (`onBiometricAuth` / `onBiometricRequired`).
+ * Can be a boolean (`true` = verified, `false` = denied) or a structured attestation object
+ * carrying a cryptographic assertion (e.g. Secure Enclave / Android Keystore signature or WebAuthn token).
+ */
+export type BiometricAttestationResult =
+  | boolean
+  | {
+      verified: boolean;
+      biometricAssertion?: string | Record<string, unknown>;
+      [key: string]: unknown;
+    };
+
+/**
+ * Context metadata passed as the 3rd argument to `onBiometricAuth` / `onBiometricRequired`
+ * and used for hardware-backed biometric attestation binding.
+ */
+export interface BiometricAuthRequest<TArgs = unknown> {
+  /** Name of the tool requesting biometric authentication. */
+  toolName: string;
+  /** Validated and deep-frozen arguments passed to the tool. */
+  args: Readonly<TArgs>;
+  /** Deterministically normalized WYSIWYS arguments (RFC 8785 / JCS). */
+  canonicalArgs: unknown;
+  /** Lowercase hex SHA-256 digest of the canonical execution envelope. */
+  payloadHash: string;
+  /** Tool schema version string (defaults to `'1'`). */
+  schemaVersion: string;
+  /** Full `ApprovalRequest` metadata object. */
+  request?: ApprovalRequest<TArgs>;
+}
+
+/**
+ * Execution context passed as the 2nd argument to `ToolDefinition.handler(args, context)`.
+ */
+export interface ToolExecutionContext {
+  /** Name of the invoked tool. */
+  toolName: string;
+  /** Schema version bound into the canonical envelope digest (defaults to `'1'`). */
+  schemaVersion: string;
+  /** Lowercase hex SHA-256 digest of the canonical execution envelope (`{ args, schemaVersion, toolName }`). */
+  payloadHash: string;
+  /** Deterministically normalized WYSIWYS arguments (RFC 8785 / JCS). */
+  canonicalArgs: unknown;
+  /** Resolved guardrail policy for this execution (`'auto' | 'confirm' | 'biometric' | 'deny'`). */
+  policy: GuardrailPolicy;
+  /** Optional hardware-backed biometric assertion returned by `onBiometricAuth` / `onBiometricRequired`. */
+  biometricAssertion?: string | Record<string, unknown>;
+}
+
+/**
  * Static policy string or dynamic policy function evaluated against the validated input.
  */
 export type PolicyResolver<TInput = unknown> =
@@ -52,14 +107,19 @@ export interface ToolDefinition<
   description: string;
   /** Zod v4 schema used to validate and parse incoming tool arguments. */
   inputSchema: TSchema;
+  /** Optional schema version string bound into the canonical SHA-256 digest. Defaults to `'1'`. */
+  schemaVersion?: string;
   /** Static policy or dynamic policy function based on parsed input. Defaults to registry's `defaultPolicy` ('auto'). */
   policy?: PolicyResolver<z.infer<TSchema>>;
   /** Optional execution timeout in milliseconds. Overrides registry's `defaultTimeoutMs`. */
   timeoutMs?: number;
   /** Optional per-tool rate limit and loop protection configuration. Overrides global `rateLimit`. */
   rateLimit?: RateLimitConfig;
-  /** Tool execution handler invoked only after validation and policy checks succeed. */
-  handler: (parsedInput: z.infer<TSchema>) => TOutput | Promise<TOutput>;
+  /** Tool execution handler invoked only after validation, policy checks, and TOCTOU digest verification succeed. */
+  handler: (
+    parsedInput: z.infer<TSchema>,
+    context: ToolExecutionContext,
+  ) => TOutput | Promise<TOutput>;
 }
 
 /**
@@ -74,6 +134,14 @@ export interface ApprovalRequest<TInput = unknown> {
   description: string;
   /** Validated and parsed arguments passed to the tool. */
   input: TInput;
+  /** Alias for `input` (validated and deep-frozen arguments). */
+  args?: Readonly<TInput>;
+  /** Deterministically normalized WYSIWYS arguments (RFC 8785 / JCS). */
+  canonicalArgs?: unknown;
+  /** Lowercase hex SHA-256 digest of the canonical execution envelope. */
+  payloadHash?: string;
+  /** Schema version bound into `payloadHash` (defaults to `'1'`). */
+  schemaVersion?: string;
   /** The resolved policy that triggered this gate ('confirm' or 'biometric'). */
   policy: 'confirm' | 'biometric';
   /** Unix epoch timestamp (ms) when the request was created. */
@@ -90,12 +158,24 @@ export type ApprovalHandler = (
 
 /**
  * Callback invoked when a tool resolves to the `'biometric'` policy.
- * Plug in `expo-local-authentication` or `react-native-biometrics` here.
- * Return `true` when biometric authentication succeeds, or `false` otherwise.
+ * Plug in `expo-local-authentication`, `react-native-biometrics`, or hardware key attestation here.
+ * Return `true` or `{ verified: true, biometricAssertion?: ... }` when biometric authentication succeeds.
  */
 export type BiometricHandler = (
   request: ApprovalRequest,
-) => boolean | Promise<boolean>;
+  args?: unknown,
+  meta?: BiometricAuthRequest,
+) => BiometricAttestationResult | Promise<BiometricAttestationResult>;
+
+/**
+ * Positional biometric authentication & hardware attestation callback (`onBiometricAuth`).
+ * Receives `(toolName, args, meta)` where `meta` contains `{ payloadHash, schemaVersion, canonicalArgs, toolName, args }`.
+ */
+export type BiometricAuthHandler = (
+  toolName: string,
+  args: unknown,
+  meta: BiometricAuthRequest,
+) => BiometricAttestationResult | Promise<BiometricAttestationResult>;
 
 /**
  * Standardized error codes returned by `registry.execute()`.
@@ -107,6 +187,7 @@ export type ToolExecutionErrorCode =
   | 'RATE_LIMITED'
   | 'USER_DENIED'
   | 'BIOMETRIC_FAILED'
+  | 'TAMPER_DETECTED'
   | 'TIMEOUT_ERROR'
   | 'EXECUTION_ERROR';
 
@@ -143,6 +224,10 @@ export interface ToolExecutionResult<TOutput = unknown> {
   llmFeedback?: string;
   /** Resolved policy for the execution ('auto' | 'confirm' | 'biometric' | 'deny'). */
   policy?: ToolPolicy;
+  /** Lowercase hex SHA-256 digest of the canonical execution envelope (`{ args, schemaVersion, toolName }`). */
+  payloadHash?: string;
+  /** Optional hardware-backed biometric assertion returned by `onBiometricAuth` / `onBiometricRequired`. */
+  biometricAssertion?: string | Record<string, unknown>;
   /** Total wall-clock execution duration in milliseconds (including validation and approval wait). */
   durationMs: number;
 }
@@ -166,6 +251,14 @@ export interface AuditLogEntry {
   rawInput: unknown;
   /** Parsed input after Zod validation (if validation succeeded). */
   parsedInput?: unknown;
+  /** Deterministically normalized WYSIWYS arguments (if validation succeeded). */
+  canonicalArgs?: unknown;
+  /** Lowercase hex SHA-256 digest of the canonical execution envelope (if validation succeeded). */
+  payloadHash?: string;
+  /** Schema version bound into `payloadHash`. */
+  schemaVersion?: string;
+  /** Optional hardware-backed biometric assertion returned by `onBiometricAuth` / `onBiometricRequired`. */
+  biometricAssertion?: string | Record<string, unknown>;
   /** Policy evaluated for this execution (if validation succeeded). */
   policy?: ToolPolicy;
   /** Final execution status. */
@@ -223,6 +316,12 @@ export interface ToolRegistryOptions {
   onApprovalRequired?: ApprovalHandler;
   /** Handler invoked when a tool requires `'biometric'` authentication. Defaults to `expo-local-authentication` when omitted. */
   onBiometricRequired?: BiometricHandler;
+  /**
+   * Hardware-backed biometric attestation & authentication callback receiving
+   * `(toolName, args, { payloadHash, schemaVersion, canonicalArgs })` and returning
+   * `boolean` or `{ verified: boolean, biometricAssertion?: string | Record<string, unknown> }`.
+   */
+  onBiometricAuth?: BiometricAuthHandler;
   /** Optional configuration for native `expo-local-authentication` prompts when `policy: 'biometric'` is triggered. */
   biometricOptions?: BiometricAuthOptions;
   /** Optional persistent storage adapter (e.g. AsyncStorage or MMKV) for audit logs. */

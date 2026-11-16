@@ -3,19 +3,28 @@ import { z } from 'zod';
 import {
   AgentApprovalProvider,
   AgentApprovalSheet,
+  canonicalizeEnvelope,
+  computePayloadHash,
   createBleSyncToolPreset,
   createCalendarEventToolPreset,
   createGuardrails,
   createMCPSSETransport,
   createPaymentToolPreset,
   createToolRegistry,
+  deepFreeze,
+  GuardrailCanonicalizationError,
+  GuardrailTamperError,
+  normalizeValue,
   toLangChainTools,
   toVercelAITools,
   zodToClaudeSchema,
   zodToOpenAISchema,
   type AuditStorageAdapter,
   type AuditTelemetryEvent,
+  type BiometricAttestationResult,
+  type BiometricAuthRequest,
   type GuardrailConfig,
+  type ToolExecutionContext,
 } from '../src';
 import {
   claudeToolsPayload,
@@ -1247,6 +1256,352 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
       expect(persistedRaw).not.toContain('alice.smith@example.com');
       expect(persistedRaw).not.toContain('super_secret_key_value');
       expect(persistedRaw).not.toContain('GB29NWBK60161331926819');
+    });
+  });
+
+  describe('15. Hardware-Backed Biometric Attestation, TOCTOU Deep-Freeze & WYSIWYS Canonical Digest', () => {
+    it('deepFreeze blocks nested mutations on objects, arrays, Dates, Maps, Sets, and TypedArrays during queued approval', async () => {
+      let capturedHandlerArgs: unknown;
+
+      const guardrails = createGuardrails({
+        defaultPolicy: 'confirm',
+        onApprovalRequired: async (req) => {
+          // Attempt TOCTOU mutation while request is queued in confirmation gate
+          const target = req.input as {
+            recipient: string;
+            amount: number;
+            nested: { note: string; tags: string[] };
+            scheduledAt: Date;
+            metadataMap: Map<string, { role: string }>;
+            permissionSet: Set<string>;
+            signatureBytes: Uint8Array;
+          };
+
+          expect(Object.isFrozen(target)).toBe(true);
+          expect(Object.isFrozen(target.nested)).toBe(true);
+          expect(Object.isFrozen(target.nested.tags)).toBe(true);
+
+          expect(() => {
+            target.amount = 999999;
+          }).toThrow(TypeError);
+          expect(() => {
+            target.nested.note = 'tampered';
+          }).toThrow(TypeError);
+          expect(() => {
+            target.nested.tags.push('injected');
+          }).toThrow(TypeError);
+          expect(() => {
+            target.scheduledAt.setFullYear(2099);
+          }).toThrow(TypeError);
+          expect(() => {
+            target.metadataMap.set('hacked', { role: 'root' });
+          }).toThrow(TypeError);
+          expect(() => {
+            target.metadataMap.get('owner')!.role = 'escalated';
+          }).toThrow(TypeError);
+          expect(() => {
+            target.permissionSet.add('admin_wipe');
+          }).toThrow(TypeError);
+          expect(() => {
+            target.signatureBytes.fill(0xff);
+          }).toThrow(TypeError);
+
+          return true;
+        },
+      }).register('secure_wire', {
+        description: 'Execute high-assurance wire transfer',
+        schemaVersion: '2.1',
+        inputSchema: z.object({
+          recipient: z.string().transform((s) => s.trim()),
+          amount: z.number(),
+          nested: z.object({
+            note: z.string().default('standard'),
+            tags: z.array(z.string()),
+          }),
+          scheduledAt: z.instanceof(Date),
+          metadataMap: z.instanceof(Map),
+          permissionSet: z.instanceof(Set),
+          signatureBytes: z.instanceof(Uint8Array),
+        }),
+        policy: 'confirm',
+        handler: (args) => {
+          capturedHandlerArgs = args;
+          return { ok: true, amount: args.amount };
+        },
+      });
+
+      const dateVal = new Date('2026-11-16T00:00:00.000Z');
+      const mapVal = new Map([['owner', { role: 'operator' }]]);
+      const setVal = new Set(['transfer:write', 'transfer:read']);
+      const bytesVal = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+
+      const res = await guardrails.execute('secure_wire', {
+        recipient: '  alice.vault  ',
+        amount: 250,
+        nested: { tags: ['urgent', 'domestic'] },
+        scheduledAt: dateVal,
+        metadataMap: mapVal,
+        permissionSet: setVal,
+        signatureBytes: bytesVal,
+      });
+
+      expect(res.success).toBe(true);
+      expect(
+        (capturedHandlerArgs as { recipient: string; amount: number }).recipient,
+      ).toBe('alice.vault');
+      expect(
+        (capturedHandlerArgs as { recipient: string; amount: number }).amount,
+      ).toBe(250);
+
+      // Also verify deepFreeze handles circular references and primitives safely
+      expect(deepFreeze(42)).toBe(42);
+      expect(deepFreeze(null)).toBeNull();
+      const circular: Record<string, unknown> = { a: 1 };
+      circular.self = circular;
+      expect(Object.isFrozen(deepFreeze(circular))).toBe(true);
+    });
+
+    it('normalizes values deterministically (RFC 8785 JCS) and computes identical SHA-256 digests regardless of key insertion order', () => {
+      const date = new Date('2026-05-01T12:30:00.000Z');
+      const bytes = new Uint8Array([0x0a, 0xff, 0x10]);
+      const setA = new Set(['beta', 'alpha', 'gamma']);
+      const setB = new Set(['gamma', 'alpha', 'beta']);
+      const mapA = new Map<string, unknown>([
+        ['zKey', 1],
+        ['aKey', 2n],
+      ]);
+      const mapB = new Map<string, unknown>([
+        ['aKey', 2n],
+        ['zKey', 1],
+      ]);
+
+      const payload1 = {
+        zebra: 'last',
+        alpha: 'first',
+         omittedUndefined: undefined,
+        bigAmount: 9007199254740993n,
+        timestamp: date,
+        binary: bytes,
+        scopes: setA,
+        headers: mapA,
+        numbers: [-0, Number.NaN, Number.POSITIVE_INFINITY, undefined],
+        nested: { b: 2, a: 1 },
+      };
+
+      const payload2 = {
+        nested: { a: 1, b: 2 },
+        numbers: [0, null, null, null],
+        headers: mapB,
+        scopes: setB,
+        binary: bytes,
+        timestamp: new Date('2026-05-01T12:30:00.000Z'),
+        bigAmount: 9007199254740993n,
+        alpha: 'first',
+        zebra: 'last',
+      };
+
+      const norm1 = normalizeValue(payload1);
+      const norm2 = normalizeValue(payload2);
+      expect(norm1).toEqual(norm2);
+      expect(norm1).toEqual({
+        alpha: 'first',
+        bigAmount: '9007199254740993n',
+        binary: 'uint8:0aff10',
+        headers: [
+          ['aKey', '2n'],
+          ['zKey', 1],
+        ],
+        nested: { a: 1, b: 2 },
+        numbers: [0, null, null, null],
+        scopes: ['alpha', 'beta', 'gamma'],
+        timestamp: '2026-05-01T12:30:00.000Z',
+        zebra: 'last',
+      });
+
+      const env1 = canonicalizeEnvelope({
+        toolName: 'crypto_sign',
+        schemaVersion: '3',
+        args: payload1,
+      });
+      const env2 = canonicalizeEnvelope({
+        toolName: 'crypto_sign',
+        schemaVersion: '3',
+        args: payload2,
+      });
+
+      expect(env1).toBe(env2);
+      const hash1 = computePayloadHash(env1);
+      const hash2 = computePayloadHash(env2);
+      expect(hash1).toBe(hash2);
+      expect(hash1).toMatch(/^[0-9a-f]{64}$/);
+
+      // Changing schemaVersion or emoji UTF-8 content changes the digest deterministically
+      const envDiffVersion = canonicalizeEnvelope({
+        toolName: 'crypto_sign',
+        schemaVersion: '4',
+        args: payload1,
+      });
+      expect(computePayloadHash(envDiffVersion)).not.toBe(hash1);
+
+      const emojiHash = computePayloadHash(
+        canonicalizeEnvelope({
+          toolName: 'emoji_tool',
+          args: { text: '🔒 Guardrail Café 中文' },
+        }),
+      );
+      expect(emojiHash).toMatch(/^[0-9a-f]{64}$/);
+
+      // Rejects Functions, Symbols, Symbol keys, invalid Dates, and circular structures
+      expect(() => normalizeValue({ fn: () => {} })).toThrow(
+        GuardrailCanonicalizationError,
+      );
+      expect(() => normalizeValue({ sym: Symbol('sec') })).toThrow(
+        GuardrailCanonicalizationError,
+      );
+      expect(() =>
+        normalizeValue({ [Symbol('key')]: 'secret' }),
+      ).toThrow(GuardrailCanonicalizationError);
+      expect(() => normalizeValue(new Date('invalid-date'))).toThrow(
+        GuardrailCanonicalizationError,
+      );
+      const circ: Record<string, unknown> = {};
+      circ.self = circ;
+      expect(() => normalizeValue(circ)).toThrow(GuardrailCanonicalizationError);
+    });
+
+    it('passes { payloadHash, schemaVersion, canonicalArgs } to onBiometricAuth and forwards biometricAssertion to tool.handler context', async () => {
+      let receivedBioTool = '';
+      let receivedBioArgs: unknown;
+      let receivedBioMeta: BiometricAuthRequest | undefined;
+      let receivedHandlerContext: ToolExecutionContext | undefined;
+
+      const onBiometricAuth = jest.fn(
+        async (
+          toolName: string,
+          args: unknown,
+          meta: BiometricAuthRequest,
+        ): Promise<BiometricAttestationResult> => {
+          receivedBioTool = toolName;
+          receivedBioArgs = args;
+          receivedBioMeta = meta;
+          return {
+            verified: true,
+            biometricAssertion: 'secure-enclave-jwt-assertion-v1',
+          };
+        },
+      );
+
+      const guardrails = createGuardrails({
+        defaultPolicy: 'biometric',
+        onBiometricAuth,
+      }).register('authorize_treasury_payout', {
+        description: 'Sign and release treasury payout',
+        schemaVersion: '2026-11',
+        inputSchema: z.object({
+          destinationWallet: z.string().transform((s) => s.toLowerCase()),
+          amountWei: z.bigint(),
+          network: z.string().default('ethereum-mainnet'),
+        }),
+        policy: 'biometric',
+        handler: (args, context) => {
+          receivedHandlerContext = context;
+          return {
+            txHash: '0xabc123',
+            amountWei: args.amountWei.toString(),
+            assertion: context.biometricAssertion,
+            digest: context.payloadHash,
+          };
+        },
+      });
+
+      const res = await guardrails.execute<{
+        txHash: string;
+        amountWei: string;
+        assertion: string;
+        digest: string;
+      }>('authorize_treasury_payout', {
+        destinationWallet: '0xABCDEF123456',
+        amountWei: 5000000000000000000n,
+      });
+
+      expect(res.success).toBe(true);
+      expect(onBiometricAuth).toHaveBeenCalledTimes(1);
+      expect(receivedBioTool).toBe('authorize_treasury_payout');
+      expect(receivedBioArgs).toEqual({
+        destinationWallet: '0xabcdef123456',
+        amountWei: 5000000000000000000n,
+        network: 'ethereum-mainnet',
+      });
+      expect(receivedBioMeta?.schemaVersion).toBe('2026-11');
+      expect(receivedBioMeta?.canonicalArgs).toEqual({
+        amountWei: '5000000000000000000n',
+        destinationWallet: '0xabcdef123456',
+        network: 'ethereum-mainnet',
+      });
+      expect(receivedBioMeta?.payloadHash).toMatch(/^[0-9a-f]{64}$/);
+
+      // Verify handler received full ToolExecutionContext with biometricAssertion & payloadHash
+      expect(receivedHandlerContext).toEqual({
+        toolName: 'authorize_treasury_payout',
+        schemaVersion: '2026-11',
+        payloadHash: receivedBioMeta?.payloadHash,
+        canonicalArgs: receivedBioMeta?.canonicalArgs,
+        policy: 'biometric',
+        biometricAssertion: 'secure-enclave-jwt-assertion-v1',
+      });
+      expect(res.biometricAssertion).toBe('secure-enclave-jwt-assertion-v1');
+      expect(res.payloadHash).toBe(receivedBioMeta?.payloadHash);
+
+      // Also test when onBiometricAuth returns { verified: false }
+      onBiometricAuth.mockResolvedValueOnce({
+        verified: false,
+      });
+      const deniedBio = await guardrails.execute('authorize_treasury_payout', {
+        destinationWallet: '0xABCDEF123456',
+        amountWei: 100n,
+      });
+      expect(deniedBio.success).toBe(false);
+      expect(deniedBio.code).toBe('BIOMETRIC_FAILED');
+    });
+
+    it('detects pre-handler TOCTOU digest drift and throws GuardrailTamperError while logging TAMPER_DETECTED in audit log', async () => {
+      const handler = jest.fn(() => ({ executed: true }));
+
+      const toolDef = {
+        description: 'Transfer sensitive asset',
+        schemaVersion: '1',
+        inputSchema: z.object({
+          to: z.string(),
+          amount: z.number(),
+        }),
+        policy: 'confirm' as const,
+        handler,
+      };
+
+      const guardrails = createGuardrails({
+        defaultPolicy: 'confirm',
+        onApprovalRequired: async () => {
+          // Simulate schema version drift / tampering after approval before handler execution
+          toolDef.schemaVersion = '2-tampered';
+          return true;
+        },
+      }).register('tamper_target_tool', toolDef);
+
+      await expect(
+        guardrails.execute('tamper_target_tool', {
+          to: 'bob',
+          amount: 500,
+        }),
+      ).rejects.toThrow(GuardrailTamperError);
+
+      expect(handler).not.toHaveBeenCalled();
+
+      const auditLog = guardrails.getAuditLog();
+      expect(auditLog).toHaveLength(1);
+      expect(auditLog[0]?.status).toBe('TAMPER_DETECTED');
+      expect(auditLog[0]?.errorMessage).toContain(
+        'TOCTOU integrity check failed',
+      );
     });
   });
 });

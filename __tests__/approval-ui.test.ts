@@ -518,4 +518,74 @@ describe('ApprovalContext & AgentApprovalSheet UI Suite', () => {
     );
     expect(strictArrSchema.additionalProperties).toBe(false);
   });
+
+  it('safely renders BigInt, Date, Map, Set, and canonicalArgs in AgentApprovalSheet without JSON.stringify TypeError', () => {
+    const harness = createReactTestHarness();
+    const mockApprove = jest.fn();
+    const mockDeny = jest.fn();
+
+    // 1. With pre-computed canonicalArgs (normal registry pipeline)
+    harness.setContextValue({
+      currentRequest: {
+        id: 'req_bigint_1',
+        toolName: 'sign_onchain_tx',
+        description: 'Sign on-chain transaction with BigInt and Date',
+        input: {
+          amountWei: 1000000000000000000n,
+          deadline: new Date('2026-11-16T12:00:00.000Z'),
+        },
+        args: {
+          amountWei: 1000000000000000000n,
+          deadline: new Date('2026-11-16T12:00:00.000Z'),
+        },
+        canonicalArgs: {
+          amountWei: '1000000000000000000n',
+          deadline: '2026-11-16T12:00:00.000Z',
+        },
+        payloadHash: 'a'.repeat(64),
+        schemaVersion: '1',
+        policy: 'confirm',
+        timestamp: Date.now(),
+      },
+      queueLength: 1,
+      approve: mockApprove,
+      deny: mockDeny,
+    });
+
+    const sheetWithCanonical = AgentApprovalSheet({ colorScheme: 'dark' });
+    expect(sheetWithCanonical).not.toBeNull();
+    expect(JSON.stringify(sheetWithCanonical)).toContain(
+      '1000000000000000000n',
+    );
+    expect(JSON.stringify(sheetWithCanonical)).toContain(
+      '2026-11-16T12:00:00.000Z',
+    );
+
+    // 2. Without pre-computed canonicalArgs (raw BigInt & Date in input/args fallback)
+    harness.setContextValue({
+      currentRequest: {
+        id: 'req_bigint_2',
+        toolName: 'sign_raw_bigint',
+        description: 'Raw BigInt fallback serialization',
+        input: {
+          rawBigInt: 42n,
+          rawDate: new Date('2026-01-01T00:00:00.000Z'),
+          rawSet: new Set(['b', 'a']),
+          rawMap: new Map([['k', 99n]]),
+        },
+        policy: 'confirm',
+        timestamp: Date.now(),
+      },
+      queueLength: 1,
+      approve: mockApprove,
+      deny: mockDeny,
+    });
+
+    const sheetFallback = AgentApprovalSheet({ colorScheme: 'light' });
+    expect(sheetFallback).not.toBeNull();
+    expect(JSON.stringify(sheetFallback)).toContain('42n');
+    expect(JSON.stringify(sheetFallback)).toContain('99n');
+
+    harness.restore();
+  });
 });

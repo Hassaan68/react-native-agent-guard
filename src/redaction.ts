@@ -184,6 +184,28 @@ export function redactPIIValue<T = unknown>(
     }
 
     if (typeof node === 'object') {
+      if (node instanceof Date || node instanceof Uint8Array) {
+        return node;
+      }
+      if (node instanceof Set) {
+        return new Set(Array.from(node).map((item) => visit(item)));
+      }
+      if (node instanceof Map) {
+        const nextMap = new Map();
+        for (const [k, v] of node.entries()) {
+          if (
+            typeof k === 'string' &&
+            v !== null &&
+            v !== undefined &&
+            isSensitiveKeyName(k, config.sensitiveKeys)
+          ) {
+            nextMap.set(k, defaultMask);
+          } else {
+            nextMap.set(visit(k), visit(v));
+          }
+        }
+        return nextMap;
+      }
       const out: Record<string, unknown> = {};
       for (const [key, val] of Object.entries(
         node as Record<string, unknown>,
