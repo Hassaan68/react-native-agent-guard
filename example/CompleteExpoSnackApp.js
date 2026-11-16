@@ -69,7 +69,7 @@ async function handleBiometricAttestation(
 }
 
 // ---------------------------------------------------------------------------
-// 1. Configure GuardrailRegistry with v0.4.4 Capabilities
+// 1. Configure GuardrailRegistry with v0.4.5 Capabilities
 // ---------------------------------------------------------------------------
 const guardrails = createGuardrails({
   defaultPolicy: 'confirm',
@@ -153,10 +153,11 @@ const guardrails = createGuardrails({
       });
 
       return {
-        wireId: `wire_${Math.floor(100000 + Math.random() * 900000)}`,
+        wireId: `wire_${context.payloadHash.slice(0, 8)}`,
         beneficiary: args.beneficiary,
         amountUSD: args.amountUSD,
         payloadHash: context.payloadHash,
+        nonce: context.nonce,
         biometricAssertion: context.biometricAssertion,
         receiptValid: receiptVerification.valid,
       };
@@ -214,7 +215,7 @@ export default function App() {
   const [auditEntries, setAuditEntries] = useState([]);
   const [activeGrants, setActiveGrants] = useState([]);
   const [statusBanner, setStatusBanner] = useState(
-    'Tap any scenario below to test v0.4.4 guardrails.',
+    'Tap any scenario below to test v0.4.5 guardrails.',
   );
   const [lastReceiptBox, setLastReceiptBox] = useState(null);
   const [codecReportBox, setCodecReportBox] = useState(null);
@@ -381,7 +382,7 @@ export default function App() {
             <View style={styles.badgeRow}>
               <View style={styles.versionBadge}>
                 <Text style={styles.versionBadgeText}>
-                  react-native-agent-guard v0.4.4
+                  react-native-agent-guard v0.4.5
                 </Text>
               </View>
               <View style={styles.codecBadge}>

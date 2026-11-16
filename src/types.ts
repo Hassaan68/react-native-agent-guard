@@ -78,6 +78,8 @@ export interface BiometricAuthRequest<TArgs = unknown> {
   payloadHash: string;
   /** Tool schema version string (defaults to `'1'`). */
   schemaVersion: string;
+  /** Cryptographic random challenge nonce bound to this approval request. */
+  nonce?: string;
   /** Full `ApprovalRequest` metadata object. */
   request?: ApprovalRequest<TArgs>;
 }
@@ -96,6 +98,8 @@ export interface ToolExecutionContext {
   canonicalArgs: unknown;
   /** Resolved guardrail policy for this execution (`'auto' | 'confirm' | 'biometric' | 'deny'`). */
   policy: GuardrailPolicy;
+  /** Cryptographic random challenge nonce bound to this execution. */
+  nonce?: string;
   /** Optional hardware-backed biometric assertion returned by `onBiometricAuth` / `onBiometricRequired`. */
   biometricAssertion?: string | Record<string, unknown>;
   /** `true` if execution was auto-authorized by an active time-bound or session-scoped `SessionGrant`. */
@@ -162,6 +166,7 @@ export interface SerializedQueuedRequest<TInput = unknown> {
   canonicalArgs?: unknown;
   payloadHash?: string;
   schemaVersion?: string;
+  nonce?: string;
   policy: 'confirm' | 'biometric';
   createdAt: number;
   timestamp: number;
@@ -266,6 +271,8 @@ export interface ApprovalRequest<TInput = unknown> {
   payloadHash?: string;
   /** Schema version bound into `payloadHash` (defaults to `'1'`). */
   schemaVersion?: string;
+  /** Cryptographic random challenge nonce bound to this approval request for replay prevention. */
+  nonce?: string;
   /** The resolved policy that triggered this gate ('confirm' or 'biometric'). */
   policy: 'confirm' | 'biometric';
   /** Unix epoch timestamp (ms) when the request was created. */
@@ -400,6 +407,8 @@ export interface AuditLogEntry {
   schemaVersion?: string;
   /** Canonicalizer algorithm version bound into `payloadHash` (e.g. `'jcs-rn-v1'`). */
   canonicalizerVersion?: string;
+  /** Cryptographic random challenge nonce bound to this execution. */
+  nonce?: string;
   /** Optional hardware-backed biometric assertion returned by `onBiometricAuth` / `onBiometricRequired`. */
   biometricAssertion?: string | Record<string, unknown>;
   /** `true` if execution was authorized by an active time-bound or session-scoped `SessionGrant`. */

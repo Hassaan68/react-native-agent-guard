@@ -19,11 +19,14 @@ import {
   CANONICALIZER_VERSION,
   canonicalizeEnvelope,
   computePayloadHash,
+  createExecutionSnapshot,
   deepFreeze,
+  generateChallengeNonce,
   GuardrailCanonicalizationError,
   GuardrailTamperError,
   GuardrailTimeoutError,
   normalizeValue,
+  reconstructFromSnapshot,
 } from './canonical';
 import {
   MCPSSETransportAdapter,
@@ -76,10 +79,17 @@ const DEFAULT_AUDIT_STORAGE_KEY = '@react-native-agent-guard/audit-log';
 const DEFAULT_MAX_AUDIT_ENTRIES = 500;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+const VALID_POLICIES = new Set<string>([
+  'auto',
+  'confirm',
+  'biometric',
+  'deny',
+]);
+
 let idCounter = 0;
 function generateId(prefix: string): string {
   idCounter += 1;
-  return `${prefix}_${Date.now()}_${idCounter}`;
+  return `${prefix}_${Date.now()}_${idCounter}_${generateChallengeNonce(6)}`;
 }
 
 function formatZodIssuesForLLM(
@@ -112,6 +122,8 @@ export class ToolRegistry {
   private readonly sessionGrants = new Map<string, SessionGrant>();
   private readonly persistedQueue = new Map<string, SerializedQueuedRequest>();
   private readonly activeQueueExpirers = new Map<string, () => void>();
+  private readonly consumedApprovalIds = new Set<string>();
+  private readonly consumedNonces = new Set<string>();
   private providerApprovalHandler?: ApprovalHandler;
   private providerBiometricHandler?: BiometricHandler;
   private providerQueueStorage?: QueueStorageAdapter;
@@ -289,6 +301,52 @@ export class ToolRegistry {
     }
 
     return this.pruneExpiredRequests();
+  }
+
+  /**
+   * Validate and consume a transaction-bound `ApprovalRequest`, ensuring:
+   * 1) Neither the request `id` nor its cryptographic `nonce` has been replayed.
+   * 2) The bound `toolName`, `payloadHash`, and `schemaVersion` match the expected execution envelope.
+   * 3) The request has not exceeded its `expiresAt` timestamp.
+   */
+  public consumeAndVerifyApprovalBinding(
+    request: ApprovalRequest,
+    expected: { toolName: string; payloadHash: string; schemaVersion: string },
+  ): void {
+    if (!request.id || this.consumedApprovalIds.has(request.id)) {
+      throw new GuardrailTamperError(
+        `Approval replay detected: approval request "${request.id}" has already been consumed.`,
+      );
+    }
+
+    if (!request.nonce || this.consumedNonces.has(request.nonce)) {
+      throw new GuardrailTamperError(
+        `Approval replay detected: challenge nonce for tool "${expected.toolName}" is missing or already consumed.`,
+      );
+    }
+
+    if (request.expiresAt !== undefined && Date.now() > request.expiresAt) {
+      throw new GuardrailTimeoutError(
+        `Approval request "${request.id}" expired before execution.`,
+      );
+    }
+
+    if (
+      request.toolName !== expected.toolName ||
+      request.payloadHash !== expected.payloadHash ||
+      request.schemaVersion !== expected.schemaVersion
+    ) {
+      throw new GuardrailTamperError(
+        `Transaction-bound approval mismatch for tool "${expected.toolName}": bound toolName, payloadHash, or schemaVersion was substituted.`,
+        {
+          expectedHash: expected.payloadHash,
+          actualHash: request.payloadHash,
+        },
+      );
+    }
+
+    this.consumedApprovalIds.add(request.id);
+    this.consumedNonces.add(request.nonce);
   }
 
   private async syncQueueStorage(): Promise<void> {
@@ -485,12 +543,15 @@ export class ToolRegistry {
       });
     }
 
-    const parsedInput = deepFreeze(parseResult.data);
+    let parsedInput: Readonly<unknown> = parseResult.data as Readonly<unknown>;
     const initialSchemaVersion = tool.schemaVersion ?? '1';
+    const executionNonce = generateChallengeNonce(16);
 
     let canonicalArgs: unknown;
     let expectedHash: string;
     try {
+      deepFreeze(parseResult.data);
+      parsedInput = createExecutionSnapshot(parseResult.data);
       canonicalArgs = normalizeValue(parsedInput);
       const envelope = canonicalizeEnvelope({
         toolName,
@@ -537,6 +598,7 @@ export class ToolRegistry {
             payloadHash: expectedHash,
             schemaVersion: initialSchemaVersion,
             canonicalizerVersion: CANONICALIZER_VERSION,
+            nonce: executionNonce,
             threats: found,
             status: 'THREAT_DETECTED',
             durationMs,
@@ -547,11 +609,11 @@ export class ToolRegistry {
       }
     }
 
-    // 3. Evaluate static or dynamic policy
+    // 3. Evaluate static or dynamic policy (fail-safe default: 'confirm')
     let resolvedPolicy: ToolPolicy;
     try {
       const policyResolver =
-        tool.policy ?? this.options.defaultPolicy ?? 'auto';
+        tool.policy ?? this.options.defaultPolicy ?? 'confirm';
       resolvedPolicy =
         typeof policyResolver === 'function'
           ? await policyResolver(parsedInput)
@@ -570,6 +632,23 @@ export class ToolRegistry {
         code: 'DENIED_BY_POLICY',
         message: `Policy evaluation failed for tool "${toolName}": ${errMsg}`,
         llmFeedback: `Tool "${toolName}" could not be executed because policy evaluation failed: ${errMsg}.`,
+      });
+    }
+
+    if (!VALID_POLICIES.has(String(resolvedPolicy))) {
+      const invalidMsg = `Invalid security policy "${String(resolvedPolicy)}" resolved for tool "${toolName}". Failing closed to 'deny'.`;
+      return this.finalizeFailure<TOutput>({
+        startTime,
+        toolName,
+        rawInput,
+        parsedInput,
+        canonicalArgs,
+        payloadHash: expectedHash,
+        schemaVersion: initialSchemaVersion,
+        policy: 'deny',
+        code: 'DENIED_BY_POLICY',
+        message: invalidMsg,
+        llmFeedback: invalidMsg,
       });
     }
 
@@ -686,6 +765,7 @@ export class ToolRegistry {
           canonicalArgs,
           payloadHash: expectedHash,
           schemaVersion: initialSchemaVersion,
+          nonce: executionNonce,
           policy: 'confirm',
           timestamp: now,
           createdAt: now,
@@ -704,6 +784,7 @@ export class ToolRegistry {
           canonicalArgs: request.canonicalArgs,
           payloadHash: request.payloadHash,
           schemaVersion: request.schemaVersion,
+          nonce: executionNonce,
           policy: 'confirm',
           createdAt: now,
           timestamp: now,
@@ -819,6 +900,12 @@ export class ToolRegistry {
             llmFeedback: `The user declined to approve tool "${toolName}". Respect the user's decision and do not immediately re-invoke this tool without asking.`,
           });
         }
+
+        this.consumeAndVerifyApprovalBinding(request, {
+          toolName,
+          payloadHash: expectedHash,
+          schemaVersion: initialSchemaVersion,
+        });
       }
     }
 
@@ -850,6 +937,7 @@ export class ToolRegistry {
           canonicalArgs,
           payloadHash: expectedHash,
           schemaVersion: initialSchemaVersion,
+          nonce: executionNonce,
           policy: 'biometric',
           timestamp: now,
           createdAt: now,
@@ -864,6 +952,7 @@ export class ToolRegistry {
           canonicalArgs,
           payloadHash: expectedHash,
           schemaVersion: initialSchemaVersion,
+          nonce: executionNonce,
           request,
         };
 
@@ -910,6 +999,12 @@ export class ToolRegistry {
             llmFeedback: `Biometric authentication for tool "${toolName}" failed or was cancelled by the user. Do not retry automatically.`,
           });
         }
+
+        this.consumeAndVerifyApprovalBinding(request, {
+          toolName,
+          payloadHash: expectedHash,
+          schemaVersion: initialSchemaVersion,
+        });
       }
     }
 
@@ -956,9 +1051,10 @@ export class ToolRegistry {
       this.options.redactPII !== null &&
       this.options.redactPII.redactHandlerInput === true;
 
+    const reconstructedInput = reconstructFromSnapshot(parsedInput);
     const handlerInput = shouldRedactHandlerInput
-      ? redactPIIValue(parsedInput, this.options.redactPII)
-      : parsedInput;
+      ? redactPIIValue(reconstructedInput, this.options.redactPII)
+      : reconstructedInput;
 
     const executionContext: ToolExecutionContext = {
       toolName,
@@ -966,6 +1062,7 @@ export class ToolRegistry {
       payloadHash: expectedHash,
       canonicalArgs,
       policy: resolvedPolicy,
+      nonce: executionNonce,
       ...(biometricAssertion !== undefined ? { biometricAssertion } : {}),
       ...(sessionGrantUsed ? { sessionGrantUsed: true } : {}),
       ...(previewResult !== undefined ? { previewResult } : {}),
@@ -1021,6 +1118,7 @@ export class ToolRegistry {
         payloadHash: expectedHash,
         schemaVersion: currentSchemaVersion,
         canonicalizerVersion: CANONICALIZER_VERSION,
+        nonce: executionNonce,
         ...(biometricAssertion !== undefined ? { biometricAssertion } : {}),
         ...(sessionGrantUsed ? { sessionGrantUsed: true } : {}),
         ...(previewResult !== undefined ? { previewResult } : {}),

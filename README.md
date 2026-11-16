@@ -951,7 +951,7 @@ const guardrails = createGuardrails({
 
 ---
 
-## API Reference: Canonicalization, Digest, Audit Chain, Preview & Threat Scanner (`v0.4.3`)
+## API Reference: Canonicalization, Digest, Audit Chain, Preview & Threat Scanner (`v0.4.5`)
 
 In addition to `createGuardrails`, `createToolRegistry`, `<AgentApprovalProvider>`, `<AgentApprovalSheet />`, `toVercelAITools`, and `toLangChainTools`, `react-native-agent-guard` exports its deterministic canonicalization, hash-chain verification, threat-scanning, and tamper-protection primitives for direct use in custom UIs or backend verification:
 
@@ -963,12 +963,19 @@ In addition to `createGuardrails`, `createToolRegistry`, `<AgentApprovalProvider
 | `canonicalizeEnvelope(params)` | `({ toolName, schemaVersion?, args }) => string` | Returns the deterministic JSON envelope string `{"args":...,"canonicalizerVersion":"jcs-rn-v1","schemaVersion":"1","toolName":"..."}` used for signing and digest verification. |
 | `computePayloadHash(envelope)` | `(envelopeString: string) => string` | Synchronous, zero-dependency SHA-256 implementation returning a 64-character lowercase hex digest across React Native (Hermes), Expo Snack Web, and Node/Jest. |
 | `deepFreeze(obj)` | `<T>(obj: T) => Readonly<T>` | Recursively freezes objects, arrays, `Date`, `Map`, `Set`, and TypedArray instances in-place (locking mutator methods) to prevent TOCTOU mutations. |
-| `verifyAuditChain(logs)` | `(logs: readonly AuditLogEntry[]) => AuditChainVerificationResult` | Recomputes every `entryHash` and `prevHash` link from genesis (`GENESIS_AUDIT_HASH`) to detect mutated, deleted, or reordered audit entries. |
+| `createExecutionSnapshot(val)` | `<T>(val: T) => Readonly<T>` | Creates a detached, deep-frozen execution snapshot of validated arguments so caller-held references cannot mutate execution state. |
+| `reconstructFromSnapshot(snapshot)` | `<T>(snapshot: T) => Readonly<T>` | Reconstructs a clean, deep-frozen execution payload from an approved snapshot immediately before handler execution. |
+| `generateChallengeNonce(byteLength?)` | `(byteLength?: number) => string` | Generates a cryptographically random lowercase hex challenge nonce (`crypto.getRandomValues()`) for transaction-bound approval and replay prevention. |
+| `verifyReceipt(receipt)` | `({ toolName, schemaVersion, canonicalizerVersion, args, payloadHash }) => { valid, reason?, recomputedHash? }` | Verifies a signed receipt against the fail-closed codec registry and SHA-256 envelope digest. |
+| `registerCanonicalizerCodec(codec)` | `(codec: CanonicalizerCodec) => void` | Registers a versioned `CanonicalizerCodec` after running self-verification against its golden `testVectors`. |
+| `getCanonicalizerCodec(version)` | `(version: string) => CanonicalizerCodec` | Retrieves a registered codec by version string or fails closed with `GuardrailUnknownCodecError`. |
+| `verifyAuditChain(logs)` | `(logs: readonly AuditLogEntry[]) => AuditChainVerificationResult` | Recomputes every `entryHash` and `prevHash` link from genesis (`GENESIS_AUDIT_HASH`) and verifies registered `canonicalizerVersion` codecs to detect mutated, deleted, or reordered audit entries. |
 | `scanArgumentsForThreats(args, config?)` | `(args: unknown, config?: ThreatScannerConfig) => ThreatDetection[]` | Recursively scans tool arguments for prompt injection, unsafe URLs / SSRF, path traversal, SQL injection, command injection, and custom rules. |
 | `GuardrailThreatError` | `class extends Error` | Thrown when `threatScanner` detects one or more security threats and `blockOnThreat !== false` (`code: 'THREAT_DETECTED'`, `threats: ThreatDetection[]`). |
-| `GuardrailTamperError` | `class extends Error` | Thrown before handler execution when pre-handler SHA-256 digest re-verification detects argument or `schemaVersion` drift (`code: 'TAMPER_DETECTED'`). |
+| `GuardrailTamperError` | `class extends Error` | Thrown before handler execution when pre-handler SHA-256 digest re-verification or approval replay/binding verification detects tampering (`code: 'TAMPER_DETECTED'`). |
 | `GuardrailTimeoutError` | `class extends Error` | Thrown when a queued approval request exceeds its configured `approvalTimeoutMs` TTL (`code: 'TIMEOUT_ERROR'`). |
-| `GuardrailCanonicalizationError` | `class extends Error` | Thrown by `normalizeValue` when an argument contains non-canonicalizable values such as functions, Symbols, circular references, or invalid `Date` instances (`code: 'CANONICALIZATION_ERROR'`). |
+| `GuardrailUnknownCodecError` | `class extends Error` | Thrown when an unregistered `canonicalizerVersion` is queried from the codec registry (`code: 'UNKNOWN_CODEC_ERROR'`). |
+| `GuardrailCanonicalizationError` | `class extends Error` | Thrown by `normalizeValue` or `createExecutionSnapshot` when an argument contains non-canonicalizable values such as `NaN`, `Infinity`, functions, Symbols, circular references, or invalid `Date` instances (`code: 'CANONICALIZATION_ERROR'`). |
 
 ---
 

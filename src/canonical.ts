@@ -553,6 +553,142 @@ export function deepFreeze<T>(obj: T): Readonly<T> {
   return deepFreezeInternal(obj, new WeakSet<object>());
 }
 
+let entropyCounter = 0;
+
+/**
+ * Generate a cryptographically random lowercase hex challenge nonce for transaction-bound
+ * approval and replay prevention. Uses `crypto.getRandomValues()` when available and falls
+ * back to a SHA-256 counter-mode entropy mixer (never `Math.random()`).
+ */
+export function generateChallengeNonce(byteLength = 16): string {
+  const bytes = new Uint8Array(byteLength);
+  const webCrypto = (
+    globalThis as unknown as {
+      crypto?: { getRandomValues?: (arr: Uint8Array) => Uint8Array };
+    }
+  ).crypto;
+
+  if (webCrypto && typeof webCrypto.getRandomValues === 'function') {
+    webCrypto.getRandomValues(bytes);
+    return bytesToHex(bytes);
+  }
+
+  entropyCounter += 1;
+  const seed = `rnag_csprng_${Date.now()}_${entropyCounter}_${typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : 0}`;
+  const digest = computePayloadHash(seed);
+  const targetHexLen = byteLength * 2;
+  return digest.repeat(Math.ceil(targetHexLen / 64)).slice(0, targetHexLen);
+}
+
+function cloneForSnapshot<T>(val: T, seen: WeakSet<object>): T {
+  if (val === null || val === undefined) {
+    return val;
+  }
+
+  const valType = typeof val;
+  if (valType === 'boolean' || valType === 'string' || valType === 'bigint') {
+    return val;
+  }
+
+  if (valType === 'number') {
+    const num = val as unknown as number;
+    if (!Number.isFinite(num)) {
+      throw new GuardrailCanonicalizationError(
+        'Cannot create execution snapshot containing non-finite number (NaN or Infinity).',
+      );
+    }
+    return (Object.is(num, -0) ? 0 : num) as unknown as T;
+  }
+
+  if (valType === 'function' || valType === 'symbol') {
+    throw new GuardrailCanonicalizationError(
+      `Cannot create execution snapshot containing ${valType} value.`,
+    );
+  }
+
+  if (valType === 'object') {
+    const obj = val as unknown as object;
+
+    if (obj instanceof Date) {
+      if (Number.isNaN(obj.getTime())) {
+        throw new GuardrailCanonicalizationError(
+          'Cannot create execution snapshot containing invalid Date value.',
+        );
+      }
+      return new Date(obj.getTime()) as unknown as T;
+    }
+
+    if (obj instanceof Uint8Array) {
+      return new Uint8Array(obj) as unknown as T;
+    }
+
+    if (seen.has(obj)) {
+      throw new GuardrailCanonicalizationError(
+        'Cannot create execution snapshot containing circular reference.',
+      );
+    }
+
+    seen.add(obj);
+    try {
+      if (obj instanceof Set) {
+        const nextSet = new Set();
+        for (const item of obj.values()) {
+          nextSet.add(cloneForSnapshot(item, seen));
+        }
+        return nextSet as unknown as T;
+      }
+
+      if (obj instanceof Map) {
+        const nextMap = new Map();
+        for (const [k, v] of obj.entries()) {
+          nextMap.set(cloneForSnapshot(k, seen), cloneForSnapshot(v, seen));
+        }
+        return nextMap as unknown as T;
+      }
+
+      if (Array.isArray(obj)) {
+        return obj.map((item) => cloneForSnapshot(item, seen)) as unknown as T;
+      }
+
+      if (Object.getOwnPropertySymbols(obj).length > 0) {
+        throw new GuardrailCanonicalizationError(
+          'Cannot create execution snapshot containing Symbol keys.',
+        );
+      }
+
+      const clonedObj: Record<string, unknown> = {};
+      for (const key of Object.keys(obj)) {
+        const propVal = (obj as Record<string, unknown>)[key];
+        if (propVal !== undefined) {
+          clonedObj[key] = cloneForSnapshot(propVal, seen);
+        }
+      }
+      return clonedObj as unknown as T;
+    } finally {
+      seen.delete(obj);
+    }
+  }
+
+  return val;
+}
+
+/**
+ * Create a detached, deep-frozen execution snapshot of validated arguments so caller-held
+ * references cannot cause Time-of-Check to Time-of-Use (TOCTOU) drift.
+ */
+export function createExecutionSnapshot<T>(val: T): Readonly<T> {
+  const cloned = cloneForSnapshot(val, new WeakSet<object>());
+  return deepFreeze(cloned);
+}
+
+/**
+ * Reconstruct a clean, deep-frozen execution payload from an approved execution snapshot
+ * immediately before invoking the tool handler.
+ */
+export function reconstructFromSnapshot<T>(snapshot: T): Readonly<T> {
+  return createExecutionSnapshot(snapshot);
+}
+
 /**
  * Built-in golden test vectors for the `'jcs-rn-v1'` canonicalizer codec.
  */

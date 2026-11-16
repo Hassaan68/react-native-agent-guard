@@ -60,7 +60,7 @@ export class GuardrailRegistry extends ToolRegistry {
   constructor(config: GuardrailConfig = {}) {
     super({
       ...config,
-      defaultPolicy: config.defaultPolicy ?? 'auto',
+      defaultPolicy: config.defaultPolicy ?? 'confirm',
     });
     this.guardrailConfig = config;
   }
@@ -68,7 +68,7 @@ export class GuardrailRegistry extends ToolRegistry {
   /**
    * Evaluate the effective permission policy for a given tool and input,
    * accounting for `blockedTools`, `allowedTools`, `permissions`, `checkPermission`,
-   * the tool's own policy, and `defaultPolicy`.
+   * the tool's own policy, and `defaultPolicy` (fail-safe default `'confirm'`).
    */
   public async checkToolPermission(
     toolName: string,
@@ -79,7 +79,7 @@ export class GuardrailRegistry extends ToolRegistry {
       allowedTools,
       permissions,
       checkPermission,
-      defaultPolicy = 'auto',
+      defaultPolicy = 'confirm',
     } = this.guardrailConfig;
 
     if (blockedTools && blockedTools.includes(toolName)) {
@@ -137,7 +137,7 @@ export class GuardrailRegistry extends ToolRegistry {
           allowedTools,
           permissions,
           checkPermission,
-          defaultPolicy = 'auto',
+          defaultPolicy = 'confirm',
         } = this.guardrailConfig;
 
         if (blockedTools && blockedTools.includes(name)) {

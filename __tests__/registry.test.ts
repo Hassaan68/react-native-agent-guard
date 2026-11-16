@@ -8,11 +8,13 @@ import {
   computePayloadHash,
   createBleSyncToolPreset,
   createCalendarEventToolPreset,
+  createExecutionSnapshot,
   createGuardrails,
   createMCPSSETransport,
   createPaymentToolPreset,
   createToolRegistry,
   deepFreeze,
+  generateChallengeNonce,
   GENESIS_AUDIT_HASH,
   getCanonicalizerCodec,
   GuardrailCanonicalizationError,
@@ -22,6 +24,7 @@ import {
   GuardrailUnknownCodecError,
   JCS_RN_V1_TEST_VECTORS,
   normalizeValue,
+  reconstructFromSnapshot,
   registerCanonicalizerCodec,
   scanArgumentsForThreats,
   toLangChainTools,
@@ -1567,13 +1570,15 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
       });
       expect(receivedBioMeta?.payloadHash).toMatch(/^[0-9a-f]{64}$/);
 
-      // Verify handler received full ToolExecutionContext with biometricAssertion & payloadHash
+      // Verify handler received full ToolExecutionContext with biometricAssertion, nonce & payloadHash
+      expect(receivedBioMeta?.nonce).toMatch(/^[0-9a-f]{32}$/);
       expect(receivedHandlerContext).toEqual({
         toolName: 'authorize_treasury_payout',
         schemaVersion: '2026-11',
         payloadHash: receivedBioMeta?.payloadHash,
         canonicalArgs: receivedBioMeta?.canonicalArgs,
         policy: 'biometric',
+        nonce: receivedBioMeta?.nonce,
         biometricAssertion: 'secure-enclave-jwt-assertion-v1',
       });
       expect(res.biometricAssertion).toBe('secure-enclave-jwt-assertion-v1');
@@ -2285,6 +2290,147 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
           ],
         }),
       ).toThrow(/Codec self-test failed for vector: broken_vector_check/);
+    });
+  });
+
+  describe('22. Production-Hardening (v0.4.5): Fail-Safe Default Policy, Immutable Snapshots & Replay Prevention', () => {
+    it('defaults unconfigured tool policies strictly to confirm (never auto) and fails closed on invalid dynamic policies', async () => {
+      const onApprovalRequired = jest.fn(async () => true);
+
+      // Omit defaultPolicy on createGuardrails and omit policy on tool definition
+      const guardrails = createGuardrails({
+        onApprovalRequired,
+      }).register('unconfigured_policy_tool', {
+        description: 'Tool with no explicit policy',
+        inputSchema: z.object({ action: z.string() }),
+        handler: ({ action }) => ({ executed: action }),
+      });
+
+      expect(
+        await guardrails.checkToolPermission('unconfigured_policy_tool', {
+          action: 'test',
+        }),
+      ).toBe('confirm');
+
+      const res = await guardrails.execute('unconfigured_policy_tool', {
+        action: 'test',
+      });
+      expect(res.success).toBe(true);
+      expect(res.policy).toBe('confirm');
+      expect(onApprovalRequired).toHaveBeenCalledTimes(1);
+
+      // Register a tool with an invalid dynamic policy return value -> fails closed to DENIED_BY_POLICY
+      const registry = createToolRegistry();
+      registry.register('invalid_policy_tool', {
+        description: 'Returns invalid policy string',
+        inputSchema: z.object({}),
+        policy: (() => 'allow_everything_invalid' as unknown as 'auto'),
+        handler: () => ({ ok: true }),
+      });
+
+      const invalidRes = await registry.execute('invalid_policy_tool', {});
+      expect(invalidRes.success).toBe(false);
+      expect(invalidRes.code).toBe('DENIED_BY_POLICY');
+      expect(invalidRes.error?.message).toContain('Invalid security policy');
+    });
+
+    it('creates detached immutable execution snapshots, generates CSPRNG challenge nonces, and blocks approval replay or substitution', async () => {
+      const nonce1 = generateChallengeNonce(16);
+      const nonce2 = generateChallengeNonce(16);
+      expect(nonce1).toMatch(/^[0-9a-f]{32}$/);
+      expect(nonce2).toMatch(/^[0-9a-f]{32}$/);
+      expect(nonce1).not.toBe(nonce2);
+
+      const rawSource = {
+        nested: { limit: 100 },
+        items: ['a', 'b'],
+        date: new Date('2026-11-16T00:00:00.000Z'),
+        bytes: new Uint8Array([1, 2, 3]),
+      };
+      const snapshot = createExecutionSnapshot(rawSource);
+      expect(snapshot).toEqual(rawSource);
+      expect(snapshot).not.toBe(rawSource);
+      expect(snapshot.nested).not.toBe(rawSource.nested);
+      expect(Object.isFrozen(snapshot)).toBe(true);
+      expect(Object.isFrozen(snapshot.nested)).toBe(true);
+
+      const reconstructed = reconstructFromSnapshot(snapshot);
+      expect(reconstructed).toEqual(snapshot);
+      expect(reconstructed).not.toBe(snapshot);
+      expect(Object.isFrozen(reconstructed)).toBe(true);
+
+      // Rejects non-finite numbers and functions in createExecutionSnapshot
+      expect(() => createExecutionSnapshot({ bad: Number.NaN })).toThrow(
+        GuardrailCanonicalizationError,
+      );
+      expect(() => createExecutionSnapshot({ fn: () => {} })).toThrow(
+        GuardrailCanonicalizationError,
+      );
+
+      // Verify transaction-bound approval replay & substitution protection
+      let capturedApprovalReq: Parameters<
+        NonNullable<GuardrailConfig['onApprovalRequired']>
+      >[0] | null = null;
+
+      const guardrails = createGuardrails({
+        onApprovalRequired: async (req) => {
+          capturedApprovalReq = req;
+          return true;
+        },
+      }).register('transfer_asset', {
+        description: 'Transfer asset',
+        schemaVersion: '1.0',
+        inputSchema: z.object({ amount: z.number() }),
+        policy: 'confirm',
+        handler: ({ amount }) => ({ transferred: amount }),
+      });
+
+      const okRes = await guardrails.execute('transfer_asset', { amount: 250 });
+      expect(okRes.success).toBe(true);
+      expect(capturedApprovalReq).not.toBeNull();
+      expect(capturedApprovalReq!.nonce).toMatch(/^[0-9a-f]{32}$/);
+
+      // Replaying the already-consumed ApprovalRequest throws GuardrailTamperError
+      expect(() =>
+        guardrails.consumeAndVerifyApprovalBinding(capturedApprovalReq!, {
+          toolName: 'transfer_asset',
+          payloadHash: capturedApprovalReq!.payloadHash!,
+          schemaVersion: '1.0',
+        }),
+      ).toThrow(GuardrailTamperError);
+
+      // Substituting toolName or payloadHash on a fresh request throws GuardrailTamperError
+      expect(() =>
+        guardrails.consumeAndVerifyApprovalBinding(
+          {
+            ...capturedApprovalReq!,
+            id: 'fresh_approval_id',
+            nonce: generateChallengeNonce(16),
+          },
+          {
+            toolName: 'different_tool',
+            payloadHash: capturedApprovalReq!.payloadHash!,
+            schemaVersion: '1.0',
+          },
+        ),
+      ).toThrow(GuardrailTamperError);
+
+      // Consuming an expired approval throws GuardrailTimeoutError
+      expect(() =>
+        guardrails.consumeAndVerifyApprovalBinding(
+          {
+            ...capturedApprovalReq!,
+            id: 'expired_approval_id',
+            nonce: generateChallengeNonce(16),
+            expiresAt: Date.now() - 1_000,
+          },
+          {
+            toolName: 'transfer_asset',
+            payloadHash: capturedApprovalReq!.payloadHash!,
+            schemaVersion: '1.0',
+          },
+        ),
+      ).toThrow(GuardrailTimeoutError);
     });
   });
 });
