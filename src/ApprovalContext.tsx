@@ -168,6 +168,11 @@ export const AgentApprovalProvider: React.FC<AgentApprovalProviderProps> = ({
 };
 
 /**
+ * Alias for `AgentApprovalProvider`.
+ */
+export const ApprovalProvider = AgentApprovalProvider;
+
+/**
  * Headless hook returning `{ currentRequest, queueLength, approve, deny }`
  * from the nearest `<AgentApprovalProvider>`.
  */
