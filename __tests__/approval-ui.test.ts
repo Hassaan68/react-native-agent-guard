@@ -586,6 +586,57 @@ describe('ApprovalContext & AgentApprovalSheet UI Suite', () => {
     expect(JSON.stringify(sheetFallback)).toContain('42n');
     expect(JSON.stringify(sheetFallback)).toContain('99n');
 
+    // 3. With enableSessionGrants & onApprove callback
+    const onApproveSpy = jest.fn();
+    const sheetWithGrants = AgentApprovalSheet({
+      colorScheme: 'dark',
+      enableSessionGrants: true,
+      onApprove: onApproveSpy,
+    });
+    expect(sheetWithGrants).not.toBeNull();
+    const serializedGrantSheet = JSON.stringify(sheetWithGrants);
+    expect(serializedGrantSheet).toContain('Approve Once');
+    expect(serializedGrantSheet).toContain('Allow for 5 mins');
+
+    // Trigger onPress on the rendered grant buttons and primary approve button
+    const collectTouchableOnPress = (
+      node: unknown,
+    ): Array<{ label?: string; onPress: () => void }> => {
+      if (!node || typeof node !== 'object') return [];
+      const elem = node as {
+        props?: {
+          accessibilityLabel?: string;
+          onPress?: () => void;
+          children?: unknown;
+        };
+      };
+      const found: Array<{ label?: string; onPress: () => void }> = [];
+      if (typeof elem.props?.onPress === 'function') {
+        found.push({
+          label: elem.props.accessibilityLabel,
+          onPress: elem.props.onPress,
+        });
+      }
+      const children = elem.props?.children;
+      if (Array.isArray(children)) {
+        for (const c of children) {
+          found.push(...collectTouchableOnPress(c));
+        }
+      } else if (children) {
+        found.push(...collectTouchableOnPress(children));
+      }
+      return found;
+    };
+
+    const buttons = collectTouchableOnPress(sheetWithGrants);
+    buttons.find((b) => b.label === 'Approve')?.onPress();
+    buttons.find((b) => b.label === 'Approve Once')?.onPress();
+    buttons.find((b) => b.label === 'Allow for 5 mins')?.onPress();
+    expect(mockApprove).toHaveBeenCalledWith(300_000, {});
+    expect(onApproveSpy).toHaveBeenCalledWith(undefined);
+    expect(onApproveSpy).toHaveBeenCalledWith(0);
+    expect(onApproveSpy).toHaveBeenCalledWith(300_000);
+
     harness.restore();
   });
 });

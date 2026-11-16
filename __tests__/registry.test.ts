@@ -13,18 +13,24 @@ import {
   createPaymentToolPreset,
   createToolRegistry,
   deepFreeze,
+  GENESIS_AUDIT_HASH,
   GuardrailCanonicalizationError,
   GuardrailTamperError,
+  GuardrailTimeoutError,
   normalizeValue,
   toLangChainTools,
   toVercelAITools,
+  verifyAuditChain,
   zodToClaudeSchema,
   zodToOpenAISchema,
+  type ApprovalResolution,
   type AuditStorageAdapter,
   type AuditTelemetryEvent,
   type BiometricAttestationResult,
   type BiometricAuthRequest,
   type GuardrailConfig,
+  type QueueStorageAdapter,
+  type SerializedQueuedRequest,
   type ToolExecutionContext,
 } from '../src';
 import {
@@ -1627,6 +1633,281 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
       expect(auditLog[0]?.errorMessage).toContain(
         'TOCTOU integrity check failed',
       );
+    });
+  });
+
+  describe('16. Time-Bound Session Grants ("Approve for 5 minutes" / Session TTL)', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('bypasses repeated confirm prompts within grant TTL and prompts again after TTL expiration', async () => {
+      const onApprovalRequired = jest.fn(
+        async (): Promise<ApprovalResolution> => ({
+          approved: true,
+          grantDurationMs: 300_000, // 5 minutes
+        }),
+      );
+
+      let latestContext: ToolExecutionContext | undefined;
+
+      const guardrails = createGuardrails({
+        defaultPolicy: 'confirm',
+        onApprovalRequired,
+      }).register('sync_crm_lead', {
+        description: 'Sync CRM lead record',
+        inputSchema: z.object({ leadId: z.string() }),
+        policy: 'confirm',
+        handler: ({ leadId }, ctx) => {
+          latestContext = ctx;
+          return { synced: leadId };
+        },
+      });
+
+      // 1st call: triggers onApprovalRequired, which returns a 5-minute session grant
+      const res1 = await guardrails.execute('sync_crm_lead', {
+        leadId: 'lead_1',
+      });
+      expect(res1.success).toBe(true);
+      expect(res1.sessionGrantUsed).toBeUndefined();
+      expect(onApprovalRequired).toHaveBeenCalledTimes(1);
+      expect(guardrails.getActiveSessionGrants()).toHaveLength(1);
+
+      // Advance time by 2 minutes (within 5-minute TTL) -> bypasses onApprovalRequired
+      jest.advanceTimersByTime(120_000);
+      const res2 = await guardrails.execute('sync_crm_lead', {
+        leadId: 'lead_2',
+      });
+      expect(res2.success).toBe(true);
+      expect(res2.sessionGrantUsed).toBe(true);
+      expect(latestContext?.sessionGrantUsed).toBe(true);
+      expect(onApprovalRequired).toHaveBeenCalledTimes(1);
+
+      const secondAudit = guardrails.getAuditLog()[1];
+      expect(secondAudit?.sessionGrantUsed).toBe(true);
+
+      // Advance time by 4 more minutes (total 6 minutes > 5-minute TTL) -> prompts again!
+      jest.advanceTimersByTime(240_000);
+      expect(guardrails.getActiveSessionGrants()).toHaveLength(0);
+
+      const res3 = await guardrails.execute('sync_crm_lead', {
+        leadId: 'lead_3',
+      });
+      expect(res3.success).toBe(true);
+      expect(onApprovalRequired).toHaveBeenCalledTimes(2);
+    });
+
+    it('supports maxCalls session grants, manual grant/revoke/clear, and opted-in biometric session grants', async () => {
+      const onBiometricRequired = jest.fn(async () => true);
+
+      const guardrails = createGuardrails({
+        defaultPolicy: 'biometric',
+        allowBiometricSessionGrants: true,
+        onBiometricRequired,
+      }).register('sign_batch_tx', {
+        description: 'Sign batch transaction',
+        inputSchema: z.object({ nonce: z.number() }),
+        policy: 'biometric',
+        handler: ({ nonce }) => ({ signedNonce: nonce }),
+      });
+
+      // Programmatically grant a session with maxCalls: 2
+      guardrails.grantSession('sign_batch_tx', 'session', {
+        maxCalls: 2,
+        policy: 'biometric',
+      });
+      expect(guardrails.getActiveSessionGrants()).toHaveLength(1);
+
+      const call1 = await guardrails.execute('sign_batch_tx', { nonce: 1 });
+      const call2 = await guardrails.execute('sign_batch_tx', { nonce: 2 });
+      expect(call1.sessionGrantUsed).toBe(true);
+      expect(call2.sessionGrantUsed).toBe(true);
+      expect(onBiometricRequired).not.toHaveBeenCalled();
+
+      // Quota of 2 calls is now exhausted -> 3rd call prompts biometric handler
+      expect(guardrails.getActiveSessionGrants()).toHaveLength(0);
+      const call3 = await guardrails.execute('sign_batch_tx', { nonce: 3 });
+      expect(call3.success).toBe(true);
+      expect(call3.sessionGrantUsed).toBeUndefined();
+      expect(onBiometricRequired).toHaveBeenCalledTimes(1);
+
+      // Test revokeSessionGrant and clearAllSessionGrants
+      guardrails.grantSession('sign_batch_tx', 60_000);
+      expect(guardrails.revokeSessionGrant('sign_batch_tx')).toBe(true);
+      expect(guardrails.getActiveSessionGrants()).toHaveLength(0);
+
+      guardrails.grantSession('sign_batch_tx', 'session');
+      guardrails.clearAllSessionGrants();
+      expect(guardrails.getActiveSessionGrants()).toHaveLength(0);
+    });
+  });
+
+  describe('17. SHA-256 Hash-Chained Tamper-Evident Audit Logs & JSON/CSV Export', () => {
+    it('maintains a cryptographic SHA-256 hash chain from genesis, detects tampering, and exports JSON & RFC 4180 CSV reports', async () => {
+      const guardrails = createGuardrails({
+        defaultPolicy: 'auto',
+      })
+        .register('log_action_a', {
+          description: 'First audited action',
+          schemaVersion: '1.0',
+          inputSchema: z.object({ note: z.string() }),
+          policy: 'auto',
+          handler: ({ note }) => ({ ok: note }),
+        })
+        .register('blocked_action_b', {
+          description: 'Blocked action with comma in error',
+          schemaVersion: '2.0',
+          inputSchema: z.object({ target: z.string() }),
+          policy: 'deny',
+          handler: () => ({ ok: false }),
+        });
+
+      await guardrails.execute('log_action_a', { note: 'first' });
+      await guardrails.execute('blocked_action_b', { target: 'vault' });
+      await guardrails.execute('log_action_a', { note: 'third' });
+
+      const logs = guardrails.getAuditLog();
+      expect(logs).toHaveLength(3);
+
+      // Verify genesis prevHash and hash-chain links
+      expect(logs[0]?.prevHash).toBe(GENESIS_AUDIT_HASH);
+      expect(logs[0]?.entryHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(logs[1]?.prevHash).toBe(logs[0]?.entryHash);
+      expect(logs[2]?.prevHash).toBe(logs[1]?.entryHash);
+
+      const validCheck = guardrails.verifyAuditChain();
+      expect(validCheck).toEqual({ valid: true });
+
+      // Test JSON compliance export
+      const jsonExport = guardrails.exportAuditLogs('json');
+      const parsedJson = JSON.parse(jsonExport) as {
+        canonicalizerVersion: string;
+        chainValid: boolean;
+        totalEntries: number;
+        entries: unknown[];
+      };
+      expect(parsedJson.canonicalizerVersion).toBe('jcs-rn-v1');
+      expect(parsedJson.chainValid).toBe(true);
+      expect(parsedJson.totalEntries).toBe(3);
+      expect(parsedJson.entries).toHaveLength(3);
+
+      // Test RFC 4180 CSV compliance export
+      const csvExport = guardrails.exportAuditLogs('csv');
+      const csvLines = csvExport.split('\n');
+      expect(csvLines[0]).toBe(
+        'timestamp,toolName,policy,status,schemaVersion,canonicalizerVersion,payloadHash,prevHash,entryHash,reason',
+      );
+      expect(csvLines).toHaveLength(4);
+      expect(csvLines[1]).toContain('log_action_a,auto,SUCCESS,1.0,jcs-rn-v1');
+      expect(csvLines[2]).toContain(
+        'blocked_action_b,deny,DENIED_BY_POLICY,2.0,jcs-rn-v1',
+      );
+
+      // Simulate tampering with entry #1's status
+      const tamperedLogs = logs.map((entry, idx) =>
+        idx === 1 ? { ...entry, status: 'SUCCESS' as const } : entry,
+      );
+      const tamperCheck = verifyAuditChain(tamperedLogs);
+      expect(tamperCheck.valid).toBe(false);
+      expect(tamperCheck.brokenAtIndex).toBe(1);
+      expect(tamperCheck.reason).toContain('Tampered audit entry at index 1');
+
+      // Simulate deleting/reordering entry #1 (breaking prevHash link at index 1)
+      const deletedMiddleLogs = [logs[0]!, logs[2]!];
+      const brokenLinkCheck = verifyAuditChain(deletedMiddleLogs);
+      expect(brokenLinkCheck.valid).toBe(false);
+      expect(brokenLinkCheck.brokenAtIndex).toBe(1);
+      expect(brokenLinkCheck.reason).toContain('Broken prevHash link at index 1');
+    });
+  });
+
+  describe('18. Persistent Offline/Background Tool Call Queue & Expiration TTL', () => {
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('rejects expired approval requests with GuardrailTimeoutError and logs a TIMEOUT_ERROR audit entry', async () => {
+      jest.useFakeTimers();
+
+      const guardrails = createGuardrails({
+        defaultPolicy: 'confirm',
+        approvalTimeoutMs: 5_000,
+        onApprovalRequired: () =>
+          new Promise<boolean>(() => {
+            // Advance fake timers once the approval prompt is active
+            jest.advanceTimersByTime(5_001);
+          }),
+      }).register('time_sensitive_trade', {
+        description: 'Execute time-sensitive market order',
+        inputSchema: z.object({ symbol: z.string(), qty: z.number() }),
+        policy: 'confirm',
+        handler: () => ({ filled: true }),
+      });
+
+      const execPromise = guardrails.execute('time_sensitive_trade', {
+        symbol: 'BTC-USD',
+        qty: 1,
+      });
+
+      await expect(execPromise).rejects.toThrow(GuardrailTimeoutError);
+      await expect(execPromise).rejects.toThrow(
+        'Approval request expired after 5000ms',
+      );
+
+      const logs = guardrails.getAuditLog();
+      expect(logs).toHaveLength(1);
+      expect(logs[0]?.status).toBe('TIMEOUT_ERROR');
+      expect(logs[0]?.errorMessage).toContain(
+        'Approval request expired after 5000ms',
+      );
+    });
+
+    it('persists queued requests to QueueStorageAdapter, hydrates non-expired requests, and prunes expired requests', async () => {
+      let persistedItems: SerializedQueuedRequest[] = [
+        {
+          id: 'expired_req_1',
+          toolName: 'wire_payment',
+          description: 'Expired wire',
+          input: { amount: 100 },
+          policy: 'confirm',
+          createdAt: Date.now() - 60_000,
+          timestamp: Date.now() - 60_000,
+          expiresAt: Date.now() - 10_000, // already expired
+        },
+        {
+          id: 'valid_req_2',
+          toolName: 'wire_payment',
+          description: 'Active wire within TTL',
+          input: { amount: 250 },
+          policy: 'confirm',
+          createdAt: Date.now(),
+          timestamp: Date.now(),
+          expiresAt: Date.now() + 60_000, // still valid
+        },
+      ];
+
+      const queueStorage: QueueStorageAdapter = {
+        loadQueue: jest.fn(async () => persistedItems),
+        saveQueue: jest.fn(async (items) => {
+          persistedItems = items;
+        }),
+      };
+
+      const guardrails = createGuardrails({
+        defaultPolicy: 'confirm',
+        queueStorage,
+      });
+
+      // Hydrate pending queue -> prunes expired_req_1 and keeps valid_req_2
+      const hydrated = await guardrails.hydratePendingQueue();
+      expect(hydrated).toHaveLength(1);
+      expect(hydrated[0]?.id).toBe('valid_req_2');
+      expect(persistedItems).toHaveLength(1);
+      expect(persistedItems[0]?.id).toBe('valid_req_2');
     });
   });
 });

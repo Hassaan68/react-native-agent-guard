@@ -13,6 +13,12 @@ import {
 } from 'react-native';
 import { useAgentApproval } from './ApprovalContext';
 import { normalizeValue } from './canonical';
+import type { SessionGrantOption } from './types';
+
+export const DEFAULT_SESSION_GRANT_OPTIONS: SessionGrantOption[] = [
+  { label: 'Approve Once', durationMs: 0 },
+  { label: 'Allow for 5 mins', durationMs: 300_000 },
+];
 
 /**
  * Theme color tokens for `<AgentApprovalSheet />`.
@@ -112,6 +118,18 @@ export interface AgentApprovalSheetProps {
   approveTextStyle?: StyleProp<TextStyle>;
   /** Custom text style for the Deny button label. */
   denyTextStyle?: StyleProp<TextStyle>;
+  /**
+   * When `true`, renders quick-action session grant buttons (defaults to `"Approve Once"` and `"Allow for 5 mins"`).
+   */
+  enableSessionGrants?: boolean;
+  /**
+   * Custom session grant options to display in the sheet (overrides `enableSessionGrants` defaults).
+   */
+  sessionGrantOptions?: SessionGrantOption[];
+  /**
+   * Optional callback invoked when the user approves the request (receives chosen `durationMs` when a session grant button is tapped).
+   */
+  onApprove?: (durationMs?: number | 'session') => void;
 }
 
 /**
@@ -138,6 +156,9 @@ export const AgentApprovalSheet: React.FC<AgentApprovalSheetProps> = ({
   denyButtonStyle,
   approveTextStyle,
   denyTextStyle,
+  enableSessionGrants = false,
+  sessionGrantOptions,
+  onApprove,
 }) => {
   const { currentRequest, queueLength, approve, deny } = useAgentApproval();
   const hookScheme =
@@ -184,6 +205,28 @@ export const AgentApprovalSheet: React.FC<AgentApprovalSheetProps> = ({
       formattedArgs = String(rawPreviewSource);
     }
   }
+
+  const activeGrantOptions: SessionGrantOption[] | undefined =
+    sessionGrantOptions ??
+    currentRequest.sessionGrantOptions ??
+    (enableSessionGrants ? DEFAULT_SESSION_GRANT_OPTIONS : undefined);
+
+  const handlePrimaryApprove = () => {
+    approve();
+    onApprove?.(undefined);
+  };
+
+  const handleGrantApprove = (option: SessionGrantOption) => {
+    if (option.durationMs === 0) {
+      approve();
+      onApprove?.(0);
+      return;
+    }
+    approve(option.durationMs, {
+      ...(option.maxCalls !== undefined ? { maxCalls: option.maxCalls } : {}),
+    });
+    onApprove?.(option.durationMs);
+  };
 
   return (
     <Modal
@@ -338,7 +381,7 @@ export const AgentApprovalSheet: React.FC<AgentApprovalSheetProps> = ({
                 buttonStyle,
                 approveButtonStyle,
               ]}
-              onPress={approve}
+              onPress={handlePrimaryApprove}
               activeOpacity={0.8}
             >
               <Text
@@ -352,6 +395,36 @@ export const AgentApprovalSheet: React.FC<AgentApprovalSheetProps> = ({
               </Text>
             </TouchableOpacity>
           </View>
+
+          {activeGrantOptions && activeGrantOptions.length > 0 ? (
+            <View style={styles.grantOptionsRow}>
+              {activeGrantOptions.map((option) => (
+                <TouchableOpacity
+                  key={`${option.label}_${String(option.durationMs)}`}
+                  accessibilityRole="button"
+                  accessibilityLabel={option.label}
+                  style={[
+                    styles.grantOptionButton,
+                    {
+                      backgroundColor: resolvedTheme.badgeBackground,
+                      borderColor: resolvedTheme.codeBorderColor,
+                    },
+                  ]}
+                  onPress={() => handleGrantApprove(option)}
+                  activeOpacity={0.8}
+                >
+                  <Text
+                    style={[
+                      styles.grantOptionText,
+                      { color: resolvedTheme.badgeTextColor },
+                    ]}
+                  >
+                    {option.label}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          ) : null}
         </View>
       </View>
     </Modal>
@@ -435,5 +508,24 @@ const styles = StyleSheet.create({
   approveButtonText: {
     fontSize: 15,
     fontWeight: '700',
+  },
+  grantOptionsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 12,
+  },
+  grantOptionButton: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  grantOptionText: {
+    fontSize: 13,
+    fontWeight: '600',
   },
 });

@@ -7,6 +7,13 @@ import {
   type VercelAIAdapterOptions,
   type VercelAIToolDefinition,
 } from './adapters';
+import {
+  computeAuditEntryHash,
+  formatAuditLogs,
+  GENESIS_AUDIT_HASH,
+  verifyAuditChain,
+  type AuditChainVerificationResult,
+} from './audit';
 import { authenticateWithExpoBiometrics } from './biometrics';
 import {
   CANONICALIZER_VERSION,
@@ -15,6 +22,7 @@ import {
   deepFreeze,
   GuardrailCanonicalizationError,
   GuardrailTamperError,
+  GuardrailTimeoutError,
   normalizeValue,
 } from './canonical';
 import {
@@ -32,6 +40,7 @@ import {
 import type {
   ApprovalHandler,
   ApprovalRequest,
+  ApprovalResolution,
   AuditExecutionStatus,
   AuditLogEntry,
   AuditOutcome,
@@ -40,10 +49,14 @@ import type {
   BiometricAuthRequest,
   BiometricHandler,
   ClaudeToolSchema,
+  GuardrailPolicy,
   MCPToolSchema,
   OpenAIToolSchema,
+  QueueStorageAdapter,
   RateLimitConfig,
   RateLimitExceededAction,
+  SerializedQueuedRequest,
+  SessionGrant,
   ToolDefinition,
   ToolExecutionContext,
   ToolExecutionErrorCode,
@@ -89,11 +102,198 @@ export class ToolRegistry {
   private readonly auditListeners = new Set<AuditTelemetryCallback>();
   private readonly toolCallTimestamps = new Map<string, number[]>();
   private readonly toolSessionCounts = new Map<string, number>();
+  private readonly sessionGrants = new Map<string, SessionGrant>();
+  private readonly persistedQueue = new Map<string, SerializedQueuedRequest>();
+  private readonly activeQueueExpirers = new Map<string, () => void>();
   private providerApprovalHandler?: ApprovalHandler;
   private providerBiometricHandler?: BiometricHandler;
+  private providerQueueStorage?: QueueStorageAdapter;
+  private providerRemoveRequest?: (requestId: string) => void;
 
   constructor(options: ToolRegistryOptions = {}) {
     this.options = options;
+  }
+
+  /**
+   * Grant a time-bound or session-scoped approval bypass for a tool.
+   */
+  public grantSession(
+    toolName: string,
+    durationMs: number | 'session',
+    options: { maxCalls?: number; policy?: GuardrailPolicy } = {},
+  ): SessionGrant {
+    const now = Date.now();
+    const expiresAt = durationMs === 'session' ? null : now + durationMs;
+    const grant: SessionGrant = {
+      toolName,
+      grantedAt: now,
+      expiresAt,
+      ...(options.maxCalls !== undefined
+        ? { remainingCalls: options.maxCalls }
+        : {}),
+      policy: options.policy ?? 'confirm',
+    };
+    this.sessionGrants.set(toolName, grant);
+    return { ...grant };
+  }
+
+  /**
+   * Revoke an active session grant for a specific tool.
+   */
+  public revokeSessionGrant(toolName: string): boolean {
+    return this.sessionGrants.delete(toolName);
+  }
+
+  /**
+   * Clear all active session grants across all tools.
+   */
+  public clearAllSessionGrants(): void {
+    this.sessionGrants.clear();
+  }
+
+  /**
+   * Return all non-expired session grants currently active in the registry.
+   */
+  public getActiveSessionGrants(): SessionGrant[] {
+    const now = Date.now();
+    const active: SessionGrant[] = [];
+    for (const [toolName, grant] of this.sessionGrants.entries()) {
+      const expired = grant.expiresAt !== null && now >= grant.expiresAt;
+      const exhausted =
+        grant.remainingCalls !== undefined && grant.remainingCalls <= 0;
+      if (expired || exhausted) {
+        this.sessionGrants.delete(toolName);
+      } else {
+        active.push({ ...grant });
+      }
+    }
+    return active;
+  }
+
+  private consumeSessionGrant(
+    toolName: string,
+    policy: 'confirm' | 'biometric',
+    allowBiometricGrant: boolean,
+  ): boolean {
+    const grant = this.sessionGrants.get(toolName);
+    if (!grant) {
+      return false;
+    }
+
+    const now = Date.now();
+    if (grant.expiresAt !== null && now >= grant.expiresAt) {
+      this.sessionGrants.delete(toolName);
+      return false;
+    }
+
+    if (grant.remainingCalls !== undefined && grant.remainingCalls <= 0) {
+      this.sessionGrants.delete(toolName);
+      return false;
+    }
+
+    if (
+      policy === 'biometric' &&
+      !allowBiometricGrant &&
+      grant.policy !== 'biometric'
+    ) {
+      return false;
+    }
+
+    if (grant.remainingCalls !== undefined) {
+      grant.remainingCalls -= 1;
+      if (grant.remainingCalls <= 0) {
+        this.sessionGrants.delete(toolName);
+      }
+    }
+
+    return true;
+  }
+
+  /**
+   * Verify the cryptographic integrity of the SHA-256 hash-chained audit log from genesis.
+   */
+  public verifyAuditChain(
+    logs: readonly AuditLogEntry[] = this.auditLog,
+  ): AuditChainVerificationResult {
+    return verifyAuditChain(logs);
+  }
+
+  /**
+   * Export audit logs into a compliance-ready `'json'` or RFC 4180 `'csv'` report string.
+   */
+  public exportAuditLogs(format: 'json' | 'csv'): string {
+    return formatAuditLogs(this.auditLog, format);
+  }
+
+  /**
+   * Internal hook used by `<AgentApprovalProvider>` to bind queue storage and request cancellation.
+   */
+  public setQueueHooks(hooks: {
+    queueStorage?: QueueStorageAdapter;
+    removeRequest?: (requestId: string) => void;
+  }): void {
+    this.providerQueueStorage = hooks.queueStorage;
+    this.providerRemoveRequest = hooks.removeRequest;
+  }
+
+  /**
+   * Return a snapshot of pending approval requests currently tracked in the queue.
+   */
+  public getPendingQueue(): SerializedQueuedRequest[] {
+    return Array.from(this.persistedQueue.values());
+  }
+
+  /**
+   * Prune expired approval requests (`Date.now() >= expiresAt`) from the in-memory and persistent queue.
+   */
+  public async pruneExpiredRequests(): Promise<SerializedQueuedRequest[]> {
+    const now = Date.now();
+    for (const [id, item] of this.persistedQueue.entries()) {
+      if (item.expiresAt !== undefined && now >= item.expiresAt) {
+        this.persistedQueue.delete(id);
+        this.providerRemoveRequest?.(id);
+        const expirer = this.activeQueueExpirers.get(id);
+        if (expirer) {
+          expirer();
+        }
+      }
+    }
+    await this.syncQueueStorage();
+    return this.getPendingQueue();
+  }
+
+  /**
+   * Hydrate pending approval requests from the configured `QueueStorageAdapter`,
+   * automatically pruning any requests whose `expiresAt` TTL has elapsed while offline/backgrounded.
+   */
+  public async hydratePendingQueue(): Promise<SerializedQueuedRequest[]> {
+    const adapter = this.providerQueueStorage ?? this.options.queueStorage;
+    if (!adapter) {
+      return this.pruneExpiredRequests();
+    }
+
+    const loaded = await adapter.loadQueue();
+    const now = Date.now();
+
+    for (const item of loaded) {
+      if (item.expiresAt === undefined || now < item.expiresAt) {
+        this.persistedQueue.set(item.id, item);
+      }
+    }
+
+    return this.pruneExpiredRequests();
+  }
+
+  private async syncQueueStorage(): Promise<void> {
+    const adapter = this.providerQueueStorage ?? this.options.queueStorage;
+    if (!adapter) {
+      return;
+    }
+    try {
+      await adapter.saveQueue(Array.from(this.persistedQueue.values()));
+    } catch {
+      // Never allow queue storage errors to interrupt execution
+    }
   }
 
   /**
@@ -375,138 +575,269 @@ export class ToolRegistry {
       resolvedPolicy = action;
     }
 
+    let sessionGrantUsed = false;
+
     if (resolvedPolicy === 'confirm') {
-      const approvalHandler =
-        this.providerApprovalHandler ?? this.options.onApprovalRequired;
+      if (this.consumeSessionGrant(toolName, 'confirm', false)) {
+        sessionGrantUsed = true;
+      } else {
+        const approvalHandler =
+          this.providerApprovalHandler ?? this.options.onApprovalRequired;
 
-      if (!approvalHandler) {
-        const message = `Tool "${toolName}" requires user confirmation ('confirm' policy), but no onApprovalRequired handler or <AgentApprovalProvider> is configured.`;
-        return this.finalizeFailure<TOutput>({
-          startTime,
+        if (!approvalHandler) {
+          const message = `Tool "${toolName}" requires user confirmation ('confirm' policy), but no onApprovalRequired handler or <AgentApprovalProvider> is configured.`;
+          return this.finalizeFailure<TOutput>({
+            startTime,
+            toolName,
+            rawInput,
+            parsedInput,
+            canonicalArgs,
+            payloadHash: expectedHash,
+            schemaVersion: initialSchemaVersion,
+            policy: resolvedPolicy,
+            code: 'USER_DENIED',
+            message,
+            llmFeedback: `Tool "${toolName}" requires user approval, which could not be obtained.`,
+          });
+        }
+
+        const now = Date.now();
+        const effectiveApprovalTimeoutMs =
+          tool.approvalTimeoutMs ?? this.options.approvalTimeoutMs;
+        const expiresAt =
+          effectiveApprovalTimeoutMs !== undefined &&
+          effectiveApprovalTimeoutMs > 0
+            ? now + effectiveApprovalTimeoutMs
+            : undefined;
+        const grantOptions =
+          tool.sessionGrantOptions ?? this.options.sessionGrantOptions;
+
+        const request: ApprovalRequest = {
+          id: generateId('approval'),
           toolName,
-          rawInput,
-          parsedInput,
+          description: tool.description,
+          input: parsedInput,
+          args: parsedInput,
           canonicalArgs,
           payloadHash: expectedHash,
           schemaVersion: initialSchemaVersion,
-          policy: resolvedPolicy,
-          code: 'USER_DENIED',
-          message,
-          llmFeedback: `Tool "${toolName}" requires user approval, which could not be obtained.`,
-        });
-      }
+          policy: 'confirm',
+          timestamp: now,
+          createdAt: now,
+          ...(expiresAt !== undefined ? { expiresAt } : {}),
+          ...(grantOptions ? { sessionGrantOptions: grantOptions } : {}),
+        };
 
-      const request: ApprovalRequest = {
-        id: generateId('approval'),
-        toolName,
-        description: tool.description,
-        input: parsedInput,
-        args: parsedInput,
-        canonicalArgs,
-        payloadHash: expectedHash,
-        schemaVersion: initialSchemaVersion,
-        policy: 'confirm',
-        timestamp: Date.now(),
-      };
+        const serializedItem: SerializedQueuedRequest = {
+          id: request.id,
+          toolName: request.toolName,
+          description: request.description,
+          input: request.input,
+          canonicalArgs: request.canonicalArgs,
+          payloadHash: request.payloadHash,
+          schemaVersion: request.schemaVersion,
+          policy: 'confirm',
+          createdAt: now,
+          timestamp: now,
+          ...(expiresAt !== undefined ? { expiresAt } : {}),
+        };
+        this.persistedQueue.set(request.id, serializedItem);
+        await this.syncQueueStorage();
 
-      let approved = false;
-      try {
-        approved = await approvalHandler(request);
-      } catch {
-        approved = false;
-      }
+        let approvalTimerId: ReturnType<typeof setTimeout> | undefined;
+        const approvalTimeoutSymbol = Symbol('APPROVAL_TIMEOUT');
+        let resolvedOutcome: ApprovalResolution | typeof approvalTimeoutSymbol =
+          false;
 
-      if (!approved) {
-        const message = `User denied execution of tool "${toolName}".`;
-        return this.finalizeFailure<TOutput>({
-          startTime,
-          toolName,
-          rawInput,
-          parsedInput,
-          canonicalArgs,
-          payloadHash: expectedHash,
-          schemaVersion: initialSchemaVersion,
-          policy: resolvedPolicy,
-          code: 'USER_DENIED',
-          message,
-          llmFeedback: `The user declined to approve tool "${toolName}". Respect the user's decision and do not immediately re-invoke this tool without asking.`,
-        });
+        try {
+          const timeoutPromise =
+            effectiveApprovalTimeoutMs !== undefined &&
+            effectiveApprovalTimeoutMs > 0
+              ? new Promise<typeof approvalTimeoutSymbol>((resolveTimeout) => {
+                  const triggerTimeout = () => {
+                    resolveTimeout(approvalTimeoutSymbol);
+                  };
+                  this.activeQueueExpirers.set(request.id, triggerTimeout);
+                  approvalTimerId = setTimeout(
+                    triggerTimeout,
+                    effectiveApprovalTimeoutMs,
+                  );
+                })
+              : null;
+
+          const handlerPromise = new Promise<ApprovalResolution>(
+            (resolveApproval, rejectApproval) => {
+              request.resolve = resolveApproval;
+              Promise.resolve(approvalHandler(request)).then(
+                resolveApproval,
+                rejectApproval,
+              );
+            },
+          );
+
+          resolvedOutcome = timeoutPromise
+            ? await Promise.race([handlerPromise, timeoutPromise])
+            : await handlerPromise;
+        } catch {
+          resolvedOutcome = false;
+        } finally {
+          if (approvalTimerId !== undefined) {
+            clearTimeout(approvalTimerId);
+          }
+          this.activeQueueExpirers.delete(request.id);
+          this.persistedQueue.delete(request.id);
+          this.providerRemoveRequest?.(request.id);
+          await this.syncQueueStorage();
+        }
+
+        if (resolvedOutcome === approvalTimeoutSymbol) {
+          const timeoutError = new GuardrailTimeoutError(
+            `Approval request expired after ${effectiveApprovalTimeoutMs}ms`,
+            effectiveApprovalTimeoutMs,
+          );
+          const durationMs = Math.max(0, Date.now() - startTime);
+          await this.recordAudit({
+            id: generateId('audit'),
+            timestamp: startTime,
+            toolName,
+            rawInput,
+            parsedInput,
+            canonicalArgs,
+            payloadHash: expectedHash,
+            schemaVersion: initialSchemaVersion,
+            canonicalizerVersion: CANONICALIZER_VERSION,
+            policy: resolvedPolicy,
+            status: 'TIMEOUT_ERROR',
+            durationMs,
+            errorMessage: timeoutError.message,
+          });
+          throw timeoutError;
+        }
+
+        let approved = false;
+        if (typeof resolvedOutcome === 'boolean') {
+          approved = resolvedOutcome;
+        } else if (
+          typeof resolvedOutcome === 'object' &&
+          resolvedOutcome !== null
+        ) {
+          approved = Boolean(resolvedOutcome.approved);
+          if (
+            approved &&
+            resolvedOutcome.grantDurationMs !== undefined &&
+            (resolvedOutcome.grantDurationMs === 'session' ||
+              resolvedOutcome.grantDurationMs > 0)
+          ) {
+            this.grantSession(toolName, resolvedOutcome.grantDurationMs, {
+              maxCalls: resolvedOutcome.maxCalls,
+              policy: 'confirm',
+            });
+          }
+        }
+
+        if (!approved) {
+          const message = `User denied execution of tool "${toolName}".`;
+          return this.finalizeFailure<TOutput>({
+            startTime,
+            toolName,
+            rawInput,
+            parsedInput,
+            canonicalArgs,
+            payloadHash: expectedHash,
+            schemaVersion: initialSchemaVersion,
+            policy: resolvedPolicy,
+            code: 'USER_DENIED',
+            message,
+            llmFeedback: `The user declined to approve tool "${toolName}". Respect the user's decision and do not immediately re-invoke this tool without asking.`,
+          });
+        }
       }
     }
 
     let biometricAssertion: string | Record<string, unknown> | undefined;
 
     if (resolvedPolicy === 'biometric') {
-      const biometricHandler =
-        this.providerBiometricHandler ??
-        this.options.onBiometricRequired ??
-        ((req: ApprovalRequest) =>
-          authenticateWithExpoBiometrics(req, this.options.biometricOptions));
+      const allowBioGrants =
+        tool.allowBiometricSessionGrants ??
+        this.options.allowBiometricSessionGrants ??
+        false;
 
-      const request: ApprovalRequest = {
-        id: generateId('biometric'),
-        toolName,
-        description: tool.description,
-        input: parsedInput,
-        args: parsedInput,
-        canonicalArgs,
-        payloadHash: expectedHash,
-        schemaVersion: initialSchemaVersion,
-        policy: 'biometric',
-        timestamp: Date.now(),
-      };
+      if (this.consumeSessionGrant(toolName, 'biometric', allowBioGrants)) {
+        sessionGrantUsed = true;
+      } else {
+        const biometricHandler =
+          this.providerBiometricHandler ??
+          this.options.onBiometricRequired ??
+          ((req: ApprovalRequest) =>
+            authenticateWithExpoBiometrics(req, this.options.biometricOptions));
 
-      const biometricMeta: BiometricAuthRequest = {
-        toolName,
-        args: parsedInput,
-        canonicalArgs,
-        payloadHash: expectedHash,
-        schemaVersion: initialSchemaVersion,
-        request,
-      };
-
-      let verified = false;
-      try {
-        const rawBioResult =
-          !this.providerBiometricHandler && this.options.onBiometricAuth
-            ? await this.options.onBiometricAuth(
-                toolName,
-                parsedInput,
-                biometricMeta,
-              )
-            : await biometricHandler(request, parsedInput, biometricMeta);
-
-        if (typeof rawBioResult === 'boolean') {
-          verified = rawBioResult;
-        } else if (
-          typeof rawBioResult === 'object' &&
-          rawBioResult !== null &&
-          'verified' in rawBioResult
-        ) {
-          verified = Boolean(rawBioResult.verified);
-          if (verified && rawBioResult.biometricAssertion !== undefined) {
-            biometricAssertion = rawBioResult.biometricAssertion;
-          }
-        }
-      } catch {
-        verified = false;
-      }
-
-      if (!verified) {
-        const message = `Biometric verification failed or was cancelled for tool "${toolName}".`;
-        return this.finalizeFailure<TOutput>({
-          startTime,
+        const now = Date.now();
+        const request: ApprovalRequest = {
+          id: generateId('biometric'),
           toolName,
-          rawInput,
-          parsedInput,
+          description: tool.description,
+          input: parsedInput,
+          args: parsedInput,
           canonicalArgs,
           payloadHash: expectedHash,
           schemaVersion: initialSchemaVersion,
-          policy: resolvedPolicy,
-          code: 'BIOMETRIC_FAILED',
-          message,
-          llmFeedback: `Biometric authentication for tool "${toolName}" failed or was cancelled by the user. Do not retry automatically.`,
-        });
+          policy: 'biometric',
+          timestamp: now,
+          createdAt: now,
+        };
+
+        const biometricMeta: BiometricAuthRequest = {
+          toolName,
+          args: parsedInput,
+          canonicalArgs,
+          payloadHash: expectedHash,
+          schemaVersion: initialSchemaVersion,
+          request,
+        };
+
+        let verified = false;
+        try {
+          const rawBioResult =
+            !this.providerBiometricHandler && this.options.onBiometricAuth
+              ? await this.options.onBiometricAuth(
+                  toolName,
+                  parsedInput,
+                  biometricMeta,
+                )
+              : await biometricHandler(request, parsedInput, biometricMeta);
+
+          if (typeof rawBioResult === 'boolean') {
+            verified = rawBioResult;
+          } else if (
+            typeof rawBioResult === 'object' &&
+            rawBioResult !== null &&
+            'verified' in rawBioResult
+          ) {
+            verified = Boolean(rawBioResult.verified);
+            if (verified && rawBioResult.biometricAssertion !== undefined) {
+              biometricAssertion = rawBioResult.biometricAssertion;
+            }
+          }
+        } catch {
+          verified = false;
+        }
+
+        if (!verified) {
+          const message = `Biometric verification failed or was cancelled for tool "${toolName}".`;
+          return this.finalizeFailure<TOutput>({
+            startTime,
+            toolName,
+            rawInput,
+            parsedInput,
+            canonicalArgs,
+            payloadHash: expectedHash,
+            schemaVersion: initialSchemaVersion,
+            policy: resolvedPolicy,
+            code: 'BIOMETRIC_FAILED',
+            message,
+            llmFeedback: `Biometric authentication for tool "${toolName}" failed or was cancelled by the user. Do not retry automatically.`,
+          });
+        }
       }
     }
 
@@ -564,6 +895,7 @@ export class ToolRegistry {
       canonicalArgs,
       policy: resolvedPolicy,
       ...(biometricAssertion !== undefined ? { biometricAssertion } : {}),
+      ...(sessionGrantUsed ? { sessionGrantUsed: true } : {}),
     };
 
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -615,6 +947,7 @@ export class ToolRegistry {
         schemaVersion: currentSchemaVersion,
         canonicalizerVersion: CANONICALIZER_VERSION,
         ...(biometricAssertion !== undefined ? { biometricAssertion } : {}),
+        ...(sessionGrantUsed ? { sessionGrantUsed: true } : {}),
         policy: resolvedPolicy,
         status: 'SUCCESS',
         durationMs,
@@ -628,6 +961,7 @@ export class ToolRegistry {
         policy: resolvedPolicy,
         payloadHash: expectedHash,
         ...(biometricAssertion !== undefined ? { biometricAssertion } : {}),
+        ...(sessionGrantUsed ? { sessionGrantUsed: true } : {}),
         durationMs,
       };
     } catch (err) {
@@ -855,23 +1189,49 @@ export class ToolRegistry {
     return 'failed';
   }
 
-  private async recordAudit(entry: AuditLogEntry): Promise<void> {
+  private async recordAudit(
+    entry: Omit<AuditLogEntry, 'prevHash' | 'entryHash'>,
+  ): Promise<void> {
     const piiOption = this.options.redactPII;
-    const sanitizedEntry: AuditLogEntry = piiOption
-      ? {
-          ...entry,
-          rawInput: redactPIIValue(entry.rawInput, piiOption),
-          ...(entry.parsedInput !== undefined
-            ? { parsedInput: redactPIIValue(entry.parsedInput, piiOption) }
-            : {}),
-          ...(entry.canonicalArgs !== undefined
-            ? { canonicalArgs: redactPIIValue(entry.canonicalArgs, piiOption) }
-            : {}),
-          ...(entry.output !== undefined
-            ? { output: redactPIIValue(entry.output, piiOption) }
-            : {}),
-        }
-      : entry;
+    const sanitizedBase: Omit<AuditLogEntry, 'prevHash' | 'entryHash'> =
+      piiOption
+        ? {
+            ...entry,
+            rawInput: redactPIIValue(entry.rawInput, piiOption),
+            ...(entry.parsedInput !== undefined
+              ? { parsedInput: redactPIIValue(entry.parsedInput, piiOption) }
+              : {}),
+            ...(entry.canonicalArgs !== undefined
+              ? {
+                  canonicalArgs: redactPIIValue(
+                    entry.canonicalArgs,
+                    piiOption,
+                  ),
+                }
+              : {}),
+            ...(entry.output !== undefined
+              ? { output: redactPIIValue(entry.output, piiOption) }
+              : {}),
+          }
+        : entry;
+
+    const prevHash =
+      this.auditLog.length > 0
+        ? (this.auditLog[this.auditLog.length - 1]?.entryHash ??
+          GENESIS_AUDIT_HASH)
+        : GENESIS_AUDIT_HASH;
+
+    const entryWithPrevHash: Omit<AuditLogEntry, 'entryHash'> = {
+      ...sanitizedBase,
+      prevHash,
+    };
+
+    const entryHash = computeAuditEntryHash(entryWithPrevHash);
+
+    const sanitizedEntry: AuditLogEntry = {
+      ...entryWithPrevHash,
+      entryHash,
+    };
 
     const maxEntries =
       this.options.maxAuditEntries ?? DEFAULT_MAX_AUDIT_ENTRIES;

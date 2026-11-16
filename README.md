@@ -787,18 +787,110 @@ const history = guardrails.getAuditLog();
 
 ---
 
-## API Reference: Canonicalization, Digest & TOCTOU Utilities (v0.4.0)
+## Time-Bound Session Grants ("Approve for 5 mins" / Session TTL) (`v0.4.2`)
 
-In addition to `createGuardrails`, `createToolRegistry`, `<AgentApprovalProvider>`, `<AgentApprovalSheet />`, `toVercelAITools`, and `toLangChainTools`, `react-native-agent-guard` exports its deterministic canonicalization and tamper-protection primitives for direct use in custom UIs or backend verification:
+Avoid modal fatigue when an AI agent performs a burst of benign confirmations by enabling time-bound or session-scoped grants in `<AgentApprovalSheet />` or programmatically via `guardrails.grantSession()`:
+
+```tsx
+import {
+  AgentApprovalProvider,
+  AgentApprovalSheet,
+  createGuardrails,
+} from 'react-native-agent-guard';
+
+const guardrails = createGuardrails({
+  defaultPolicy: 'confirm',
+  sessionGrantOptions: [
+    { label: 'Approve Once', durationMs: 0 },
+    { label: 'Allow for 5 mins', durationMs: 300_000 },
+    { label: 'Allow for Session', durationMs: 'session', maxCalls: 10 },
+  ],
+});
+
+// Or manage grants programmatically:
+guardrails.grantSession('sync_crm_lead', 300_000, { maxCalls: 5 });
+const activeGrants = guardrails.getActiveSessionGrants();
+guardrails.revokeSessionGrant('sync_crm_lead');
+guardrails.clearAllSessionGrants();
+
+// In your React Native component tree:
+<AgentApprovalProvider registry={guardrails}>
+  <AppContent />
+  <AgentApprovalSheet
+    enableSessionGrants={true}
+    onApprove={(durationMs) => {
+      console.log('Approved with session grant duration:', durationMs);
+    }}
+  />
+</AgentApprovalProvider>;
+```
+
+---
+
+## Tamper-Evident SHA-256 Hash-Chained Audit Logs & Compliance Export (`v0.4.2`)
+
+Every `AuditLogEntry` includes `prevHash` (starting from 64 zeros `'0'.repeat(64)` at genesis) and a deterministic `entryHash` computed over the RFC 8785 canonicalized entry. You can verify the entire chain against tampering and export compliance-ready `'json'` or RFC 4180 `'csv'` reports for SIEM ingestion:
+
+```ts
+import { verifyAuditChain } from 'react-native-agent-guard';
+
+// 1. Verify cryptographic hash-chain continuity from genesis
+const verification = guardrails.verifyAuditChain();
+// -> { valid: true } (or { valid: false, brokenAtIndex: 2, reason: '...' } if tampered)
+
+// 2. Export structured JSON compliance report
+const jsonReport = guardrails.exportAuditLogs('json');
+
+// 3. Export RFC 4180 CSV report (timestamp,toolName,policy,status,schemaVersion,canonicalizerVersion,payloadHash,prevHash,entryHash,reason)
+const csvReport = guardrails.exportAuditLogs('csv');
+```
+
+---
+
+## Persistent Offline/Background Queue & Approval Expiration TTL (`v0.4.2`)
+
+Configure `approvalTimeoutMs` to automatically expire stale confirmation prompts with `GuardrailTimeoutError`, and plug in a `queueStorage` adapter (`AsyncStorage` / `MMKV`) to persist and rehydrate pending requests across app backgrounding:
+
+```ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { createGuardrails, GuardrailTimeoutError } from 'react-native-agent-guard';
+
+const guardrails = createGuardrails({
+  defaultPolicy: 'confirm',
+  approvalTimeoutMs: 60_000, // Reject unapproved requests after 60s with GuardrailTimeoutError
+  queueStorage: {
+    loadQueue: async () => {
+      const raw = await AsyncStorage.getItem('@agent-guard/pending-queue');
+      return raw ? JSON.parse(raw) : [];
+    },
+    saveQueue: async (items) => {
+      await AsyncStorage.setItem('@agent-guard/pending-queue', JSON.stringify(items));
+    },
+  },
+});
+
+// When the app returns to foreground, rehydrate valid requests and prune expired ones:
+const activeQueue = await guardrails.hydratePendingQueue();
+await guardrails.pruneExpiredRequests();
+```
+
+---
+
+## API Reference: Canonicalization, Digest, Audit Chain & TOCTOU Utilities (`v0.4.2`)
+
+In addition to `createGuardrails`, `createToolRegistry`, `<AgentApprovalProvider>`, `<AgentApprovalSheet />`, `toVercelAITools`, and `toLangChainTools`, `react-native-agent-guard` exports its deterministic canonicalization, hash-chain verification, and tamper-protection primitives for direct use in custom UIs or backend verification:
 
 | Export | Signature / Type | Description |
 | :--- | :--- | :--- |
 | `CANONICALIZER_VERSION` | `'jcs-rn-v1'` | Constant identifying the RFC 8785 (JCS) + React Native canonicalization algorithm version bound into every canonical envelope and audit log entry. |
 | `normalizeValue(val)` | `(val: unknown) => unknown` | Recursively normalizes values for RFC 8785 (JCS) and WYSIWYS parity: sorts object keys lexicographically by UTF-16 code units, omits `undefined` properties, converts `Date` to ISO-8601 UTC strings, `BigInt` to `"${val}n"`, `Uint8Array` to `"uint8:<hex>"`, deterministically sorts `Set` and `Map` entries, and rejects `NaN`, `Infinity`, functions, and Symbols with `GuardrailCanonicalizationError`. |
+| `canonicalizeValue(val)` | `(val: unknown) => string` | Serializes any value into a deterministic RFC 8785 (JCS) JSON string. |
 | `canonicalizeEnvelope(params)` | `({ toolName, schemaVersion?, args }) => string` | Returns the deterministic JSON envelope string `{"args":...,"canonicalizerVersion":"jcs-rn-v1","schemaVersion":"1","toolName":"..."}` used for signing and digest verification. |
 | `computePayloadHash(envelope)` | `(envelopeString: string) => string` | Synchronous, zero-dependency SHA-256 implementation returning a 64-character lowercase hex digest across React Native (Hermes), Expo Snack Web, and Node/Jest. |
 | `deepFreeze(obj)` | `<T>(obj: T) => Readonly<T>` | Recursively freezes objects, arrays, `Date`, `Map`, `Set`, and TypedArray instances in-place (locking mutator methods) to prevent TOCTOU mutations. |
+| `verifyAuditChain(logs)` | `(logs: readonly AuditLogEntry[]) => AuditChainVerificationResult` | Recomputes every `entryHash` and `prevHash` link from genesis (`GENESIS_AUDIT_HASH`) to detect mutated, deleted, or reordered audit entries. |
 | `GuardrailTamperError` | `class extends Error` | Thrown before handler execution when pre-handler SHA-256 digest re-verification detects argument or `schemaVersion` drift (`code: 'TAMPER_DETECTED'`). |
+| `GuardrailTimeoutError` | `class extends Error` | Thrown when a queued approval request exceeds its configured `approvalTimeoutMs` TTL (`code: 'TIMEOUT_ERROR'`). |
 | `GuardrailCanonicalizationError` | `class extends Error` | Thrown by `normalizeValue` when an argument contains non-canonicalizable values such as functions, Symbols, circular references, or invalid `Date` instances (`code: 'CANONICALIZATION_ERROR'`). |
 
 ---

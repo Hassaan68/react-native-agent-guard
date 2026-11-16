@@ -41,6 +41,21 @@ export class GuardrailTamperError extends Error {
 }
 
 /**
+ * Error thrown when a queued approval request exceeds its configured `approvalTimeoutMs` TTL.
+ */
+export class GuardrailTimeoutError extends Error {
+  public readonly code = 'TIMEOUT_ERROR' as const;
+  public readonly timeoutMs?: number;
+
+  constructor(message: string, timeoutMs?: number) {
+    super(message);
+    this.name = 'GuardrailTimeoutError';
+    this.timeoutMs = timeoutMs;
+    Object.setPrototypeOf(this, GuardrailTimeoutError.prototype);
+  }
+}
+
+/**
  * Compare two strings lexicographically by UTF-16 code units (RFC 8785 / JCS standard).
  */
 function compareUTF16CodeUnits(a: string, b: string): number {
@@ -206,6 +221,14 @@ function normalizeValueInternal(
  */
 export function normalizeValue(val: unknown): unknown {
   return normalizeValueInternal(val, new WeakSet<object>());
+}
+
+/**
+ * Deterministically serialize any value into an RFC 8785 (JCS) canonical JSON string.
+ */
+export function canonicalizeValue(val: unknown): string {
+  const normalized = normalizeValue(val);
+  return JSON.stringify(normalized === undefined ? null : normalized);
 }
 
 export interface CanonicalEnvelopeParams {

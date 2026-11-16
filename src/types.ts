@@ -64,6 +64,78 @@ export interface ToolExecutionContext {
   policy: GuardrailPolicy;
   /** Optional hardware-backed biometric assertion returned by `onBiometricAuth` / `onBiometricRequired`. */
   biometricAssertion?: string | Record<string, unknown>;
+  /** `true` if execution was auto-authorized by an active time-bound or session-scoped `SessionGrant`. */
+  sessionGrantUsed?: boolean;
+}
+
+/**
+ * Quick-action option for time-bound or session-scoped user approval grants
+ * (e.g., `{ label: 'Allow for 5 mins', durationMs: 300_000 }`).
+ */
+export interface SessionGrantOption {
+  /** Human-readable button label displayed in `<AgentApprovalSheet />`. */
+  label: string;
+  /** Grant TTL in milliseconds, or `'session'` for the lifetime of the registry session. */
+  durationMs: number | 'session';
+  /** Whether this option may be used to grant temporary bypasses for `'biometric'` policies. Defaults to `false`. */
+  allowBiometricDowngrade?: boolean;
+  /** Optional cap on the number of calls permitted under this session grant. */
+  maxCalls?: number;
+}
+
+/**
+ * Active time-bound or session-scoped approval grant stored in `GuardrailRegistry`.
+ */
+export interface SessionGrant {
+  /** Name of the tool covered by this grant. */
+  toolName: string;
+  /** Unix epoch timestamp (ms) when the grant was created. */
+  grantedAt: number;
+  /** Unix epoch timestamp (ms) when the grant expires, or `null` for `'session'` grants. */
+  expiresAt: number | null;
+  /** Optional remaining call quota before the grant is automatically revoked. */
+  remainingCalls?: number;
+  /** The policy tier covered by this grant (`'confirm'` or `'biometric'`). */
+  policy: GuardrailPolicy;
+}
+
+/**
+ * Resolution value returned by an `ApprovalHandler` or passed to `request.resolve(...)`.
+ * Can be a simple boolean (`true` = approve once, `false` = deny) or an object specifying a `grantDurationMs` / `maxCalls` session grant.
+ */
+export type ApprovalResolution =
+  | boolean
+  | {
+      approved: boolean;
+      grantDurationMs?: number | 'session';
+      maxCalls?: number;
+    };
+
+/**
+ * Serializable representation of a pending approval request for offline/background persistence via `QueueStorageAdapter`.
+ */
+export interface SerializedQueuedRequest<TInput = unknown> {
+  id: string;
+  toolName: string;
+  description: string;
+  input: TInput;
+  canonicalArgs?: unknown;
+  payloadHash?: string;
+  schemaVersion?: string;
+  policy: 'confirm' | 'biometric';
+  createdAt: number;
+  timestamp: number;
+  expiresAt?: number;
+}
+
+/**
+ * Storage adapter interface for persisting and rehydrating pending approval requests across app backgrounding/restarts.
+ */
+export interface QueueStorageAdapter {
+  loadQueue: () =>
+    | Promise<SerializedQueuedRequest[]>
+    | SerializedQueuedRequest[];
+  saveQueue: (items: SerializedQueuedRequest[]) => Promise<void> | void;
 }
 
 /**
@@ -113,8 +185,14 @@ export interface ToolDefinition<
   policy?: PolicyResolver<z.infer<TSchema>>;
   /** Optional execution timeout in milliseconds. Overrides registry's `defaultTimeoutMs`. */
   timeoutMs?: number;
+  /** Optional approval expiration TTL in milliseconds when waiting in the confirmation queue. Overrides registry's `approvalTimeoutMs`. */
+  approvalTimeoutMs?: number;
   /** Optional per-tool rate limit and loop protection configuration. Overrides global `rateLimit`. */
   rateLimit?: RateLimitConfig;
+  /** Optional time-bound session grant presets offered in `<AgentApprovalSheet />` for this tool. */
+  sessionGrantOptions?: SessionGrantOption[];
+  /** Whether active session grants may bypass `'biometric'` prompts for this tool. Defaults to `false`. */
+  allowBiometricSessionGrants?: boolean;
   /** Tool execution handler invoked only after validation, policy checks, and TOCTOU digest verification succeed. */
   handler: (
     parsedInput: z.infer<TSchema>,
@@ -146,15 +224,23 @@ export interface ApprovalRequest<TInput = unknown> {
   policy: 'confirm' | 'biometric';
   /** Unix epoch timestamp (ms) when the request was created. */
   timestamp: number;
+  /** Unix epoch timestamp (ms) when the request was created (alias for `timestamp`). */
+  createdAt?: number;
+  /** Optional Unix epoch timestamp (ms) when this approval request expires (`createdAt + approvalTimeoutMs`). */
+  expiresAt?: number;
+  /** Optional time-bound session grant presets available for this request. */
+  sessionGrantOptions?: SessionGrantOption[];
+  /** Optional direct resolution callback supporting `boolean` or `{ approved, grantDurationMs, maxCalls }`. */
+  resolve?: (resolution: ApprovalResolution) => void;
 }
 
 /**
  * Callback invoked when a tool resolves to the `'confirm'` policy.
- * Return `true` to allow execution, or `false` to deny.
+ * Return `true` / `{ approved: true, grantDurationMs?: ... }` to allow execution, or `false` to deny.
  */
 export type ApprovalHandler = (
   request: ApprovalRequest,
-) => boolean | Promise<boolean>;
+) => ApprovalResolution | Promise<ApprovalResolution>;
 
 /**
  * Callback invoked when a tool resolves to the `'biometric'` policy.
@@ -228,6 +314,8 @@ export interface ToolExecutionResult<TOutput = unknown> {
   payloadHash?: string;
   /** Optional hardware-backed biometric assertion returned by `onBiometricAuth` / `onBiometricRequired`. */
   biometricAssertion?: string | Record<string, unknown>;
+  /** `true` if execution was authorized by an active time-bound or session-scoped `SessionGrant`. */
+  sessionGrantUsed?: boolean;
   /** Total wall-clock execution duration in milliseconds (including validation and approval wait). */
   durationMs: number;
 }
@@ -261,6 +349,8 @@ export interface AuditLogEntry {
   canonicalizerVersion?: string;
   /** Optional hardware-backed biometric assertion returned by `onBiometricAuth` / `onBiometricRequired`. */
   biometricAssertion?: string | Record<string, unknown>;
+  /** `true` if execution was authorized by an active time-bound or session-scoped `SessionGrant`. */
+  sessionGrantUsed?: boolean;
   /** Policy evaluated for this execution (if validation succeeded). */
   policy?: ToolPolicy;
   /** Final execution status. */
@@ -271,6 +361,10 @@ export interface AuditLogEntry {
   output?: unknown;
   /** Error message on failure. */
   errorMessage?: string;
+  /** SHA-256 hex digest of the preceding audit log entry (or 64 zeros `'0'.repeat(64)` for the genesis entry). */
+  prevHash: string;
+  /** Deterministic SHA-256 hex digest of this entry (including `prevHash`). */
+  entryHash: string;
 }
 
 /**
@@ -314,6 +408,14 @@ export interface ToolRegistryOptions {
   defaultPolicy?: ToolPolicy;
   /** Default execution timeout in milliseconds if not specified per tool. Defaults to `30000` (30s). */
   defaultTimeoutMs?: number;
+  /** Optional TTL in milliseconds for queued user approval requests before rejecting with `GuardrailTimeoutError`. */
+  approvalTimeoutMs?: number;
+  /** Optional storage adapter for persisting pending approval requests across app restarts/backgrounding. */
+  queueStorage?: QueueStorageAdapter;
+  /** Optional time-bound session grant presets offered in `<AgentApprovalSheet />`. */
+  sessionGrantOptions?: SessionGrantOption[];
+  /** Whether active session grants may bypass `'biometric'` prompts globally. Defaults to `false`. */
+  allowBiometricSessionGrants?: boolean;
   /** Handler invoked when a tool requires `'confirm'` approval. */
   onApprovalRequired?: ApprovalHandler;
   /** Handler invoked when a tool requires `'biometric'` authentication. Defaults to `expo-local-authentication` when omitted. */
