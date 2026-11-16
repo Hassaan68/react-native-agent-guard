@@ -876,9 +876,84 @@ await guardrails.pruneExpiredRequests();
 
 ---
 
-## API Reference: Canonicalization, Digest, Audit Chain & TOCTOU Utilities (`v0.4.2`)
+## Dry-Run / Diff Previews (`preview(args)`) in `<AgentApprovalSheet />` (`v0.4.3`)
 
-In addition to `createGuardrails`, `createToolRegistry`, `<AgentApprovalProvider>`, `<AgentApprovalSheet />`, `toVercelAITools`, and `toLangChainTools`, `react-native-agent-guard` exports its deterministic canonicalization, hash-chain verification, and tamper-protection primitives for direct use in custom UIs or backend verification:
+Give users human-readable context before they approve sensitive tool calls by defining a sync or async `preview(args)` function on any tool. `<AgentApprovalSheet />` automatically renders the returned `summary`, `riskLevel` badge, and structured `before -> after` diffs above the raw JSON arguments:
+
+```ts
+import { z } from 'zod';
+import { createGuardrails } from 'react-native-agent-guard';
+
+const guardrails = createGuardrails({
+  defaultPolicy: 'confirm',
+}).register('update_subscription_plan', {
+  description: 'Upgrade user subscription tier',
+  inputSchema: z.object({
+    userId: z.string(),
+    newPlan: z.enum(['pro', 'enterprise']),
+  }),
+  policy: 'confirm',
+  // Evaluated with deep-frozen post-Zod arguments before showing <AgentApprovalSheet />
+  preview: async (args) => ({
+    summary: `Upgrade account ${args.userId} to ${args.newPlan.toUpperCase()}`,
+    riskLevel: 'medium',
+    before: { plan: 'free', monthlyUSD: 0 },
+    after: { plan: args.newPlan, monthlyUSD: 49 },
+    changes: [
+      { field: 'plan', before: 'free', after: args.newPlan },
+      { field: 'monthlyUSD', before: 0, after: 49 },
+    ],
+  }),
+  handler: async (args, { previewResult }) => ({
+    upgradedTo: args.newPlan,
+    previewSummary:
+      typeof previewResult === 'object' ? previewResult.summary : previewResult,
+  }),
+});
+```
+
+---
+
+## Input Threat Scanner Middleware (`threatScanner`) (`v0.4.3`)
+
+Automatically inspect all nested string arguments for **indirect prompt injection, SSRF / unsafe URLs (`169.254.169.254`, `localhost`, private RFC 1918 ranges, `javascript:`, `file://`), path traversal (`../`), SQL injection, shell command injection (`$(...)`), and custom rules** before `policy()`, `preview()`, or `handler()` executes:
+
+```ts
+import { z } from 'zod';
+import {
+  createGuardrails,
+  GuardrailThreatError,
+  scanArgumentsForThreats,
+} from 'react-native-agent-guard';
+
+const guardrails = createGuardrails({
+  defaultPolicy: 'auto',
+  threatScanner: {
+    enabled: true,
+    blockOnThreat: true, // Throw GuardrailThreatError immediately (or set false to escalate 'auto' -> 'confirm')
+    checkPromptInjection: true,
+    checkUnsafeUrls: true,
+    checkPathTraversal: true,
+    checkSqlInjection: true,
+    checkCommandInjection: true,
+    allowedDomains: ['api.stripe.com', 'api.your-app.com'],
+    blockedDomains: ['evil.example.org'],
+    customRules: [
+      {
+        name: 'internal_token_leak',
+        pattern: /INTERNAL_SECRET_\d+/,
+        message: 'Internal secret token cannot be passed to external tools',
+      },
+    ],
+  },
+});
+```
+
+---
+
+## API Reference: Canonicalization, Digest, Audit Chain, Preview & Threat Scanner (`v0.4.3`)
+
+In addition to `createGuardrails`, `createToolRegistry`, `<AgentApprovalProvider>`, `<AgentApprovalSheet />`, `toVercelAITools`, and `toLangChainTools`, `react-native-agent-guard` exports its deterministic canonicalization, hash-chain verification, threat-scanning, and tamper-protection primitives for direct use in custom UIs or backend verification:
 
 | Export | Signature / Type | Description |
 | :--- | :--- | :--- |
@@ -889,6 +964,8 @@ In addition to `createGuardrails`, `createToolRegistry`, `<AgentApprovalProvider
 | `computePayloadHash(envelope)` | `(envelopeString: string) => string` | Synchronous, zero-dependency SHA-256 implementation returning a 64-character lowercase hex digest across React Native (Hermes), Expo Snack Web, and Node/Jest. |
 | `deepFreeze(obj)` | `<T>(obj: T) => Readonly<T>` | Recursively freezes objects, arrays, `Date`, `Map`, `Set`, and TypedArray instances in-place (locking mutator methods) to prevent TOCTOU mutations. |
 | `verifyAuditChain(logs)` | `(logs: readonly AuditLogEntry[]) => AuditChainVerificationResult` | Recomputes every `entryHash` and `prevHash` link from genesis (`GENESIS_AUDIT_HASH`) to detect mutated, deleted, or reordered audit entries. |
+| `scanArgumentsForThreats(args, config?)` | `(args: unknown, config?: ThreatScannerConfig) => ThreatDetection[]` | Recursively scans tool arguments for prompt injection, unsafe URLs / SSRF, path traversal, SQL injection, command injection, and custom rules. |
+| `GuardrailThreatError` | `class extends Error` | Thrown when `threatScanner` detects one or more security threats and `blockOnThreat !== false` (`code: 'THREAT_DETECTED'`, `threats: ThreatDetection[]`). |
 | `GuardrailTamperError` | `class extends Error` | Thrown before handler execution when pre-handler SHA-256 digest re-verification detects argument or `schemaVersion` drift (`code: 'TAMPER_DETECTED'`). |
 | `GuardrailTimeoutError` | `class extends Error` | Thrown when a queued approval request exceeds its configured `approvalTimeoutMs` TTL (`code: 'TIMEOUT_ERROR'`). |
 | `GuardrailCanonicalizationError` | `class extends Error` | Thrown by `normalizeValue` when an argument contains non-canonicalizable values such as functions, Symbols, circular references, or invalid `Date` instances (`code: 'CANONICALIZATION_ERROR'`). |

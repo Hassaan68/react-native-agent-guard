@@ -20,6 +20,20 @@ export const DEFAULT_SESSION_GRANT_OPTIONS: SessionGrantOption[] = [
   { label: 'Allow for 5 mins', durationMs: 300_000 },
 ];
 
+function formatDiffValue(val: unknown): string {
+  if (val === undefined) {
+    return 'none';
+  }
+  if (typeof val === 'string') {
+    return val;
+  }
+  try {
+    return JSON.stringify(normalizeValue(val));
+  } catch {
+    return String(val);
+  }
+}
+
 /**
  * Theme color tokens for `<AgentApprovalSheet />`.
  * Can be partially overridden via the `theme` prop to match the host app's design system.
@@ -317,6 +331,121 @@ export const AgentApprovalSheet: React.FC<AgentApprovalSheetProps> = ({
               {currentRequest.description}
             </Text>
 
+            {currentRequest.threats && currentRequest.threats.length > 0 ? (
+              <View style={styles.threatWarningBox}>
+                <Text style={styles.threatWarningTitle}>
+                  ⚠️ SECURITY WARNING ({currentRequest.threats.length} threat
+                  {currentRequest.threats.length > 1 ? 's' : ''} detected)
+                </Text>
+                {currentRequest.threats.map((threat, idx) => (
+                  <Text
+                    key={`${threat.category}_${threat.fieldPath}_${idx}`}
+                    style={styles.threatWarningItem}
+                  >
+                    • [{threat.category}] {threat.fieldPath}: {threat.message}
+                  </Text>
+                ))}
+              </View>
+            ) : null}
+
+            {currentRequest.previewResult !== undefined ||
+            currentRequest.previewError !== undefined ? (
+              <View>
+                <Text
+                  style={[
+                    styles.sectionLabel,
+                    { color: resolvedTheme.sectionLabelColor },
+                    sectionLabelStyle,
+                  ]}
+                >
+                  IMPACT PREVIEW / DRY-RUN DIFF
+                </Text>
+                <View
+                  style={[
+                    styles.codeBlock,
+                    {
+                      backgroundColor: resolvedTheme.codeBackground,
+                      borderColor: resolvedTheme.codeBorderColor,
+                    },
+                    codeBlockStyle,
+                  ]}
+                >
+                  {currentRequest.previewError ? (
+                    <Text
+                      style={[
+                        styles.codeText,
+                        { color: resolvedTheme.denyButtonTextColor },
+                      ]}
+                    >
+                      Preview unavailable: {currentRequest.previewError}
+                    </Text>
+                  ) : typeof currentRequest.previewResult === 'string' ? (
+                    <Text
+                      style={[
+                        styles.codeText,
+                        { color: resolvedTheme.codeTextColor },
+                        codeTextStyle,
+                      ]}
+                    >
+                      {currentRequest.previewResult}
+                    </Text>
+                  ) : (
+                    <View>
+                      {currentRequest.previewResult?.riskLevel ? (
+                        <Text
+                          style={[
+                            styles.riskBadgeText,
+                            { color: resolvedTheme.badgeTextColor },
+                          ]}
+                        >
+                          RISK:{' '}
+                          {currentRequest.previewResult.riskLevel.toUpperCase()}
+                        </Text>
+                      ) : null}
+                      {currentRequest.previewResult?.summary ? (
+                        <Text
+                          style={[
+                            styles.previewSummaryText,
+                            { color: resolvedTheme.toolNameColor },
+                          ]}
+                        >
+                          {currentRequest.previewResult.summary}
+                        </Text>
+                      ) : null}
+                      {currentRequest.previewResult?.changes?.map((change) => (
+                        <Text
+                          key={change.field}
+                          style={[
+                            styles.codeText,
+                            { color: resolvedTheme.codeTextColor },
+                            codeTextStyle,
+                          ]}
+                        >
+                          {change.field}: {formatDiffValue(change.before)} {'->'}{' '}
+                          {formatDiffValue(change.after)}
+                        </Text>
+                      ))}
+                      {currentRequest.previewResult?.before !== undefined ||
+                      currentRequest.previewResult?.after !== undefined ? (
+                        <Text
+                          style={[
+                            styles.codeText,
+                            { color: resolvedTheme.codeTextColor },
+                            codeTextStyle,
+                          ]}
+                        >
+                          Before:{' '}
+                          {formatDiffValue(currentRequest.previewResult?.before)}{' '}
+                          {'->'} After:{' '}
+                          {formatDiffValue(currentRequest.previewResult?.after)}
+                        </Text>
+                      ) : null}
+                    </View>
+                  )}
+                </View>
+              </View>
+            ) : null}
+
             <Text
               style={[
                 styles.sectionLabel,
@@ -527,5 +656,34 @@ const styles = StyleSheet.create({
   grantOptionText: {
     fontSize: 13,
     fontWeight: '600',
+  },
+  threatWarningBox: {
+    backgroundColor: '#450A0A',
+    borderColor: '#DC2626',
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 12,
+    marginTop: 10,
+  },
+  threatWarningTitle: {
+    color: '#FCA5A5',
+    fontSize: 12,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  threatWarningItem: {
+    color: '#FECACA',
+    fontSize: 12,
+    marginTop: 2,
+  },
+  riskBadgeText: {
+    fontSize: 11,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  previewSummaryText: {
+    fontSize: 13,
+    fontWeight: '600',
+    marginBottom: 4,
   },
 });

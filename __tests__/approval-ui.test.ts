@@ -637,6 +637,86 @@ describe('ApprovalContext & AgentApprovalSheet UI Suite', () => {
     expect(onApproveSpy).toHaveBeenCalledWith(0);
     expect(onApproveSpy).toHaveBeenCalledWith(300_000);
 
+    // 4. With dry-run previewResult (structured diff, string preview, and previewError) + threats warning banner
+    harness.setContextValue({
+      currentRequest: {
+        id: 'req_preview_1',
+        toolName: 'update_firewall_rule',
+        description: 'Modify production firewall rule',
+        input: { port: 22, openToWorld: true },
+        previewResult: {
+          summary: 'Open SSH port 22 to 0.0.0.0/0',
+          riskLevel: 'critical',
+          before: { cidr: '10.0.0.0/8' },
+          after: { cidr: '0.0.0.0/0' },
+          changes: [
+            { field: 'cidr', before: '10.0.0.0/8', after: '0.0.0.0/0' },
+          ],
+        },
+        threats: [
+          {
+            category: 'unsafe_url',
+            fieldPath: 'endpoint',
+            matchedPattern: 'ssrf_private_or_metadata_host',
+            snippet: 'http://169.254.169.254',
+            message: 'Cloud metadata SSRF target is forbidden.',
+          },
+        ],
+        policy: 'confirm',
+        timestamp: Date.now(),
+      },
+      queueLength: 1,
+      approve: mockApprove,
+      deny: mockDeny,
+    });
+
+    const sheetWithPreviewAndThreat = AgentApprovalSheet({
+      colorScheme: 'dark',
+    });
+    const serializedPreview = JSON.stringify(sheetWithPreviewAndThreat);
+    expect(serializedPreview).toContain('IMPACT PREVIEW / DRY-RUN DIFF');
+    expect(serializedPreview).toContain('Open SSH port 22 to 0.0.0.0/0');
+    expect(serializedPreview).toContain('CRITICAL');
+    expect(serializedPreview).toContain('SECURITY WARNING');
+    expect(serializedPreview).toContain('unsafe_url');
+
+    // String preview and previewError branches
+    harness.setContextValue({
+      currentRequest: {
+        id: 'req_preview_str',
+        toolName: 'send_email',
+        description: 'Send email',
+        input: {},
+        previewResult: 'Will send 1 email to alice@example.com',
+        policy: 'confirm',
+        timestamp: Date.now(),
+      },
+      queueLength: 1,
+      approve: mockApprove,
+      deny: mockDeny,
+    });
+    expect(
+      JSON.stringify(AgentApprovalSheet({ colorScheme: 'light' })),
+    ).toContain('Will send 1 email to alice@example.com');
+
+    harness.setContextValue({
+      currentRequest: {
+        id: 'req_preview_err',
+        toolName: 'send_email',
+        description: 'Send email',
+        input: {},
+        previewError: 'Preview network timeout',
+        policy: 'confirm',
+        timestamp: Date.now(),
+      },
+      queueLength: 1,
+      approve: mockApprove,
+      deny: mockDeny,
+    });
+    expect(
+      JSON.stringify(AgentApprovalSheet({ colorScheme: 'light' })),
+    ).toContain('Preview network timeout');
+
     harness.restore();
   });
 });

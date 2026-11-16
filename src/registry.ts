@@ -32,6 +32,12 @@ import {
 } from './mcp';
 import { redactPIIValue } from './redaction';
 import {
+  GuardrailThreatError,
+  resolveThreatScannerConfig,
+  scanArgumentsForThreats,
+  type ThreatDetection,
+} from './threatScanner';
+import {
   zodToClaudeSchema,
   zodToMCPSchema,
   zodToOpenAISchema,
@@ -62,6 +68,7 @@ import type {
   ToolExecutionErrorCode,
   ToolExecutionResult,
   ToolPolicy,
+  ToolPreviewResult,
   ToolRegistryOptions,
 } from './types';
 
@@ -507,6 +514,39 @@ export class ToolRegistry {
       throw err;
     }
 
+    // 2b. Run Input Threat Scanner Middleware (if configured at global or per-tool level)
+    let detectedThreats: ThreatDetection[] | undefined;
+    const threatConfig = resolveThreatScannerConfig(
+      this.options.threatScanner,
+      tool.threatScanner,
+    );
+    if (threatConfig) {
+      const found = scanArgumentsForThreats(parsedInput, threatConfig);
+      if (found.length > 0) {
+        detectedThreats = found;
+        if (threatConfig.blockOnThreat !== false) {
+          const threatError = new GuardrailThreatError(toolName, found);
+          const durationMs = Math.max(0, Date.now() - startTime);
+          await this.recordAudit({
+            id: generateId('audit'),
+            timestamp: startTime,
+            toolName,
+            rawInput,
+            parsedInput,
+            canonicalArgs,
+            payloadHash: expectedHash,
+            schemaVersion: initialSchemaVersion,
+            canonicalizerVersion: CANONICALIZER_VERSION,
+            threats: found,
+            status: 'THREAT_DETECTED',
+            durationMs,
+            errorMessage: threatError.message,
+          });
+          throw threatError;
+        }
+      }
+    }
+
     // 3. Evaluate static or dynamic policy
     let resolvedPolicy: ToolPolicy;
     try {
@@ -531,6 +571,16 @@ export class ToolRegistry {
         message: `Policy evaluation failed for tool "${toolName}": ${errMsg}`,
         llmFeedback: `Tool "${toolName}" could not be executed because policy evaluation failed: ${errMsg}.`,
       });
+    }
+
+    if (
+      detectedThreats &&
+      detectedThreats.length > 0 &&
+      threatConfig &&
+      threatConfig.blockOnThreat === false &&
+      resolvedPolicy === 'auto'
+    ) {
+      resolvedPolicy = threatConfig.escalatePolicy ?? 'confirm';
     }
 
     if (resolvedPolicy === 'deny') {
@@ -576,11 +626,26 @@ export class ToolRegistry {
     }
 
     let sessionGrantUsed = false;
+    let previewResult: ToolPreviewResult | undefined;
+    let previewError: string | undefined;
+
+    const evaluatePreviewIfNeeded = async () => {
+      if (!tool.preview || previewResult !== undefined || previewError !== undefined) {
+        return;
+      }
+      try {
+        previewResult = await tool.preview(parsedInput);
+      } catch (err) {
+        previewError =
+          err instanceof Error ? err.message : String(err ?? 'Preview error');
+      }
+    };
 
     if (resolvedPolicy === 'confirm') {
       if (this.consumeSessionGrant(toolName, 'confirm', false)) {
         sessionGrantUsed = true;
       } else {
+        await evaluatePreviewIfNeeded();
         const approvalHandler =
           this.providerApprovalHandler ?? this.options.onApprovalRequired;
 
@@ -626,6 +691,9 @@ export class ToolRegistry {
           createdAt: now,
           ...(expiresAt !== undefined ? { expiresAt } : {}),
           ...(grantOptions ? { sessionGrantOptions: grantOptions } : {}),
+          ...(previewResult !== undefined ? { previewResult } : {}),
+          ...(previewError !== undefined ? { previewError } : {}),
+          ...(detectedThreats ? { threats: detectedThreats } : {}),
         };
 
         const serializedItem: SerializedQueuedRequest = {
@@ -765,6 +833,7 @@ export class ToolRegistry {
       if (this.consumeSessionGrant(toolName, 'biometric', allowBioGrants)) {
         sessionGrantUsed = true;
       } else {
+        await evaluatePreviewIfNeeded();
         const biometricHandler =
           this.providerBiometricHandler ??
           this.options.onBiometricRequired ??
@@ -784,6 +853,9 @@ export class ToolRegistry {
           policy: 'biometric',
           timestamp: now,
           createdAt: now,
+          ...(previewResult !== undefined ? { previewResult } : {}),
+          ...(previewError !== undefined ? { previewError } : {}),
+          ...(detectedThreats ? { threats: detectedThreats } : {}),
         };
 
         const biometricMeta: BiometricAuthRequest = {
@@ -896,6 +968,9 @@ export class ToolRegistry {
       policy: resolvedPolicy,
       ...(biometricAssertion !== undefined ? { biometricAssertion } : {}),
       ...(sessionGrantUsed ? { sessionGrantUsed: true } : {}),
+      ...(previewResult !== undefined ? { previewResult } : {}),
+      ...(previewError !== undefined ? { previewError } : {}),
+      ...(detectedThreats ? { threats: detectedThreats } : {}),
     };
 
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -948,6 +1023,9 @@ export class ToolRegistry {
         canonicalizerVersion: CANONICALIZER_VERSION,
         ...(biometricAssertion !== undefined ? { biometricAssertion } : {}),
         ...(sessionGrantUsed ? { sessionGrantUsed: true } : {}),
+        ...(previewResult !== undefined ? { previewResult } : {}),
+        ...(previewError !== undefined ? { previewError } : {}),
+        ...(detectedThreats ? { threats: detectedThreats } : {}),
         policy: resolvedPolicy,
         status: 'SUCCESS',
         durationMs,
@@ -1182,7 +1260,8 @@ export class ToolRegistry {
       status === 'DENIED_BY_POLICY' ||
       status === 'RATE_LIMITED' ||
       status === 'USER_DENIED' ||
-      status === 'BIOMETRIC_FAILED'
+      status === 'BIOMETRIC_FAILED' ||
+      status === 'THREAT_DETECTED'
     ) {
       return 'denied';
     }

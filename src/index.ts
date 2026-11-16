@@ -11,6 +11,7 @@ import type {
 export * from './types';
 export * from './canonical';
 export * from './audit';
+export * from './threatScanner';
 export * from './biometrics';
 export * from './redaction';
 export * from './mcp';

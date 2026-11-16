@@ -1,6 +1,34 @@
 import type { z } from 'zod';
 import type { BiometricAuthOptions } from './biometrics';
 import type { PIIRedactionOption } from './redaction';
+import type { ThreatDetection, ThreatScannerOption } from './threatScanner';
+
+/**
+ * Single field-level before/after diff entry returned by a tool's `preview(args)` generator.
+ */
+export interface ToolPreviewDiffEntry {
+  field: string;
+  before?: unknown;
+  after?: unknown;
+}
+
+/**
+ * Risk classification badge displayed in `<AgentApprovalSheet />` for dry-run previews.
+ */
+export type ToolPreviewRiskLevel = 'low' | 'medium' | 'high' | 'critical';
+
+/**
+ * Dry-run impact preview or structured before/after diff returned by `ToolDefinition.preview(args)`.
+ */
+export type ToolPreviewResult =
+  | string
+  | {
+      summary?: string;
+      before?: Record<string, unknown> | unknown;
+      after?: Record<string, unknown> | unknown;
+      changes?: ToolPreviewDiffEntry[];
+      riskLevel?: ToolPreviewRiskLevel;
+    };
 
 /**
  * Execution policy for a registered agent tool.
@@ -66,6 +94,12 @@ export interface ToolExecutionContext {
   biometricAssertion?: string | Record<string, unknown>;
   /** `true` if execution was auto-authorized by an active time-bound or session-scoped `SessionGrant`. */
   sessionGrantUsed?: boolean;
+  /** Optional dry-run preview or before/after diff computed before approval. */
+  previewResult?: ToolPreviewResult;
+  /** Optional error message if `tool.preview(args)` threw during dry-run evaluation. */
+  previewError?: string;
+  /** Optional threat detections flagged when `threatScanner` ran with `blockOnThreat: false`. */
+  threats?: ThreatDetection[];
 }
 
 /**
@@ -193,6 +227,12 @@ export interface ToolDefinition<
   sessionGrantOptions?: SessionGrantOption[];
   /** Whether active session grants may bypass `'biometric'` prompts for this tool. Defaults to `false`. */
   allowBiometricSessionGrants?: boolean;
+  /** Optional dry-run / impact preview generator evaluated before presenting `<AgentApprovalSheet />`. */
+  preview?: (
+    parsedInput: z.infer<TSchema>,
+  ) => Promise<ToolPreviewResult> | ToolPreviewResult;
+  /** Optional per-tool input threat scanner configuration (overrides global `threatScanner`). */
+  threatScanner?: ThreatScannerOption;
   /** Tool execution handler invoked only after validation, policy checks, and TOCTOU digest verification succeed. */
   handler: (
     parsedInput: z.infer<TSchema>,
@@ -230,6 +270,12 @@ export interface ApprovalRequest<TInput = unknown> {
   expiresAt?: number;
   /** Optional time-bound session grant presets available for this request. */
   sessionGrantOptions?: SessionGrantOption[];
+  /** Optional dry-run impact preview or before/after diff computed by `tool.preview(args)`. */
+  previewResult?: ToolPreviewResult;
+  /** Optional error message if `tool.preview(args)` failed during dry-run evaluation. */
+  previewError?: string;
+  /** Optional threat detections attached when `threatScanner` runs with `blockOnThreat: false`. */
+  threats?: ThreatDetection[];
   /** Optional direct resolution callback supporting `boolean` or `{ approved, grantDurationMs, maxCalls }`. */
   resolve?: (resolution: ApprovalResolution) => void;
 }
@@ -274,6 +320,7 @@ export type ToolExecutionErrorCode =
   | 'USER_DENIED'
   | 'BIOMETRIC_FAILED'
   | 'TAMPER_DETECTED'
+  | 'THREAT_DETECTED'
   | 'TIMEOUT_ERROR'
   | 'EXECUTION_ERROR';
 
@@ -351,6 +398,12 @@ export interface AuditLogEntry {
   biometricAssertion?: string | Record<string, unknown>;
   /** `true` if execution was authorized by an active time-bound or session-scoped `SessionGrant`. */
   sessionGrantUsed?: boolean;
+  /** Optional dry-run preview result computed by `tool.preview(args)`. */
+  previewResult?: ToolPreviewResult;
+  /** Optional error message if `tool.preview(args)` failed. */
+  previewError?: string;
+  /** Optional list of security threats detected in tool arguments by `threatScanner`. */
+  threats?: ThreatDetection[];
   /** Policy evaluated for this execution (if validation succeeded). */
   policy?: ToolPolicy;
   /** Final execution status. */
@@ -451,6 +504,11 @@ export interface ToolRegistryOptions {
    * Masks emails, phone numbers, credit cards, SSNs, JWT/Bearer tokens, and sensitive keys without mutating handler input.
    */
   redactPII?: PIIRedactionOption;
+  /**
+   * Optional input threat scanner middleware for detecting prompt injection, unsafe URLs / SSRF,
+   * path traversal, SQL injection, command injection, and custom security rules.
+   */
+  threatScanner?: ThreatScannerOption;
 }
 
 /**
