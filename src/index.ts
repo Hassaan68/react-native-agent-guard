@@ -121,6 +121,7 @@ export class GuardrailRegistry extends ToolRegistry {
   public override register<TSchema extends z.ZodType, TOutput = unknown>(
     name: string,
     definition: ToolDefinition<TSchema, TOutput>,
+    options?: { overwrite?: boolean },
   ): this {
     const originalPolicy = definition.policy;
     const wrappedDefinition: ToolDefinition<TSchema, TOutput> = {
@@ -176,7 +177,7 @@ export class GuardrailRegistry extends ToolRegistry {
       },
     };
 
-    return super.register(name, wrappedDefinition);
+    return super.register(name, wrappedDefinition, options);
   }
 
   public override async execute<TOutput = unknown>(

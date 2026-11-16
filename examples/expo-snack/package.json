@@ -1,7 +1,7 @@
 {
   "main": "App.js",
   "dependencies": {
-    "react-native-agent-guard": "0.4.5",
+    "react-native-agent-guard": "0.4.6",
     "zod": "3.23.8",
     "expo-local-authentication": "~14.0.1"
   }

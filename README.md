@@ -67,20 +67,20 @@ yarn add react-native-agent-guard zod
 
 ## Live Interactive Playground (Expo Snack)
 
-Want to test `react-native-agent-guard` (`v0.3.2`) directly in your browser or on your phone via **Expo Go** in under 30 seconds?
+Want to test `react-native-agent-guard` (`v0.4.6`) directly in your browser or on your phone via **Expo Go** in under 30 seconds?
 
 👉 **[Launch the Live Expo Snack Demo (`@hassaan68/react-native-agent-guard-demo`)](https://snack.expo.dev/@hassaan68/react-native-agent-guard-demo)**
 
 Or copy the source files directly from this repository:
 1. Open **[https://snack.expo.dev/@hassaan68/react-native-agent-guard-demo](https://snack.expo.dev/@hassaan68/react-native-agent-guard-demo)**.
-2. Inspect the dependencies in **[`examples/expo-snack/package.json`](./examples/expo-snack/package.json)** (`react-native-agent-guard@0.3.2`, `zod`, `expo-local-authentication`).
-3. View or customize the single-file interactive dashboard in **[`examples/expo-snack/App.js`](./examples/expo-snack/App.js)**.
+2. Inspect the dependencies in **[`examples/expo-snack/package.json`](./examples/expo-snack/package.json)** (`react-native-agent-guard@0.4.6`, `zod`, `expo-local-authentication`).
+3. View or customize the single-file interactive dashboard in **[`example/CompleteExpoSnackApp.js`](./example/CompleteExpoSnackApp.js)** (or **[`examples/expo-snack/App.js`](./examples/expo-snack/App.js)**).
 
 The Snack playground lets you interactively test:
-- **Dynamic Policy Routing**: `< $50` (`'auto'`), `$50–$199` (`<AgentApprovalSheet />`), and `$200+` (`'biometric'` with web/simulator fallback).
-- **Agent Loop Protection**: Spam-clicking an `'auto'` tool to trigger automatic policy escalation to `'confirm'` after `maxCallsPerMinute` is exceeded.
-- **Live PII Redaction**: Inspecting real-time `onAudit` telemetry with automatic masking of emails, credit cards, SSNs, phone numbers, and Bearer tokens.
-- **Vercel AI SDK & OpenAI Strict Exports**: Viewing generated `toVercelAITools()` and `toOpenAITools({ strict: true })` schemas.
+- **Dry-Run Diff Previews & 5-Min Session Grants**: Viewing `preview(args)` Before/After diffs inside `<AgentApprovalSheet />` and bypassing repeated prompts within a 5-minute TTL window.
+- **Hardware Biometric Attestation & `verifyReceipt()`**: Signing RFC 8785 canonical SHA-256 `payloadHash` digests via `onBiometricAuth` and verifying receipts on device.
+- **Input Threat Scanner Middleware**: Blocking indirect prompt injection and cloud metadata SSRF (`169.254.169.254`) with `GuardrailThreatError`.
+- **SHA-256 Hash-Chained Audit Trail & Golden Codec Vectors**: Verifying `prevHash -> entryHash` continuity with `verifyAuditChain()`, testing `JCS_RN_V1_TEST_VECTORS`, and exporting JSON/CSV compliance reports.
 
 ---
 
@@ -139,16 +139,16 @@ When a tool's policy resolves to `'biometric'`, `react-native-agent-guard` autom
 
 ---
 
-## Hardware-Backed Biometric Attestation & TOCTOU Protection (v0.4.0)
+## Hardware-Backed Biometric Attestation & TOCTOU Protection (v0.4.6)
 
 In high-assurance fintech, wallet, enterprise, and healthcare apps, a boolean result from a client-side biometric prompt is not sufficient on its own—your backend needs cryptographic proof of **which exact tool, schema version, and arguments** the user approved on their device, and the client runtime must prevent Time-of-Check to Time-of-Use (TOCTOU) argument mutation while a request waits in the approval queue.
 
-### How the v0.4.0 Integrity Pipeline Works
+### How the v0.4.6 Integrity Pipeline Works
 
-1. **Immediate TOCTOU Deep-Freeze (`deepFreeze`)**: As soon as `inputSchema.safeParseAsync()` succeeds (including any Zod `.default()` and `.transform()` steps), `react-native-agent-guard` recursively freezes `parsedArgs` in-place—locking plain objects, arrays, `Date`, `Map`, `Set`, and TypedArray mutator methods so concurrent code cannot mutate queued arguments while awaiting user confirmation or biometrics.
+1. **Copy-Based Immutable Execution Snapshots (`createExecutionSnapshot` & `deepFreeze`)**: As soon as `inputSchema.safeParseAsync()` succeeds (including any Zod `.default()` and `.transform()` steps), `react-native-agent-guard` deep-clones `parsedArgs` into a detached, recursively frozen execution snapshot—locking plain objects, arrays, `Date`, `Map`, `Set`, and wrapping TypedArrays (`Uint8Array`) in read-only `Proxy` views that reject both mutator methods (`fill`, `set`) and direct indexed writes (`bytes[0] = 99`).
 2. **RFC 8785 (JCS) Deterministic Canonicalization & WYSIWYS Parity (`normalizeValue` & `canonicalizeEnvelope`)**: Arguments are normalized into a deterministic JSON envelope (`{ args, canonicalizerVersion: 'jcs-rn-v1', schemaVersion, toolName }`) with UTF-16 code-unit sorted keys and safe serialization of `Date` (ISO-8601 UTC), `BigInt` (`"1000n"`), `Uint8Array` (`"uint8:<hex>"`), `Set`, and `Map` (while rejecting `NaN`, `Infinity`, functions, and `Symbol`s with `GuardrailCanonicalizationError`). `<AgentApprovalSheet />` renders `request.canonicalArgs` so What-You-See-Is-What-You-Sign (WYSIWYS) matches the exact bytes hashed.
 3. **Cryptographic Biometric Attestation (`onBiometricAuth`)**: A zero-dependency, synchronous SHA-256 digest (`payloadHash`) of the canonical envelope is passed to `onBiometricAuth` so you can sign the digest using iOS Secure Enclave, Android Keystore, or WebAuthn/Passkeys and return `{ verified: true, biometricAssertion }`.
-4. **Pre-Handler SHA-256 Re-Verification (`GuardrailTamperError`)**: Immediately before invoking `tool.handler(args, context)`, the registry recomputes the SHA-256 digest of the envelope. If any argument or `schemaVersion` drifted between approval and execution, execution is aborted with `GuardrailTamperError` and recorded as `TAMPER_DETECTED` in the audit log.
+4. **Transaction-Bound Nonce & Pre-Handler Re-Verification (`consumeAndVerifyApprovalBinding` & `reconstructFromSnapshot`)**: Every approval is bound to a CSPRNG challenge `nonce` (`crypto.getRandomValues()`), preventing replay or tool/argument substitution. Immediately before invoking `tool.handler(args, context)`, the registry recomputes the SHA-256 digest of the snapshot, reconstructs a fresh frozen copy via `reconstructFromSnapshot()`, and passes an `AbortSignal` (`context.signal`) for cooperative timeout cancellation.
 
 ### End-to-End Hardware Attestation Example
 
@@ -951,22 +951,79 @@ const guardrails = createGuardrails({
 
 ---
 
-## API Reference: Canonicalization, Digest, Audit Chain, Preview & Threat Scanner (`v0.4.5`)
+## Cross-Runtime Golden Test Vectors & Codec Revision Pinning (`v0.4.6`)
+
+To guarantee that canonical envelopes and SHA-256 digests are 100% identical across **React Native (Hermes / JavaScriptCore)**, **Web (V8 / SpiderMonkey / WebKit)**, and **Node.js**, `react-native-agent-guard` exports its golden test vector suite (`JCS_RN_V1_TEST_VECTORS`), `CODEC_REVISION` (`'rev-1'`), and `JCS_RN_V1_VECTOR_SET_HASH` publicly.
+
+Every canonical envelope embeds `codecRevision: 'rev-1'` and `vectorSetHash` alongside `canonicalizerVersion: 'jcs-rn-v1'`, and `verifyReceipt()` fails closed if either the codec revision or the vector-set hash drifts:
+
+```ts
+import {
+  CANONICALIZER_VERSION,
+  CODEC_REVISION,
+  computePayloadHash,
+  getCanonicalizerCodec,
+  JCS_RN_V1_TEST_VECTORS,
+  JCS_RN_V1_VECTOR_SET_HASH,
+  verifyReceipt,
+} from 'react-native-agent-guard';
+
+// 1. Inspect the registered 'jcs-rn-v1' codec and its pinned revision metadata
+const codec = getCanonicalizerCodec(CANONICALIZER_VERSION);
+console.log(codec.version);        // 'jcs-rn-v1'
+console.log(codec.codecRevision);  // 'rev-1'
+console.log(codec.vectorSetHash);  // 'c5218c0d77a435b4eb500919973f7c695398c69910f938bd1953b28a7310b43f'
+
+// 2. Run all golden test vectors (UTF-16 key sorting, Date ISO, BigInt, Map, Set, Uint8Array)
+// inside your Hermes, JSC, or V8 runtime:
+for (const vector of JCS_RN_V1_TEST_VECTORS) {
+  const actualCanonical = codec.canonicalizeEnvelope(vector.envelope);
+  const actualHash = computePayloadHash(actualCanonical);
+
+  if (
+    actualCanonical !== vector.expectedCanonical ||
+    actualHash !== vector.expectedHash
+  ) {
+    throw new Error(`Golden vector mismatch on ${vector.name}`);
+  }
+
+  // 3. Verify receipt with strict codecRevision and vectorSetHash pinning
+  const verification = verifyReceipt({
+    toolName: vector.envelope.toolName,
+    schemaVersion: vector.envelope.schemaVersion,
+    canonicalizerVersion: CANONICALIZER_VERSION,
+    codecRevision: CODEC_REVISION,
+    vectorSetHash: JCS_RN_V1_VECTOR_SET_HASH,
+    args: vector.envelope.args,
+    payloadHash: vector.expectedHash,
+  });
+
+  console.log(vector.name, verification.valid); // true
+}
+```
+
+---
+
+## API Reference: Canonicalization, Digest, Audit Chain, Preview & Threat Scanner (`v0.4.6`)
 
 In addition to `createGuardrails`, `createToolRegistry`, `<AgentApprovalProvider>`, `<AgentApprovalSheet />`, `toVercelAITools`, and `toLangChainTools`, `react-native-agent-guard` exports its deterministic canonicalization, hash-chain verification, threat-scanning, and tamper-protection primitives for direct use in custom UIs or backend verification:
 
 | Export | Signature / Type | Description |
 | :--- | :--- | :--- |
 | `CANONICALIZER_VERSION` | `'jcs-rn-v1'` | Constant identifying the RFC 8785 (JCS) + React Native canonicalization algorithm version bound into every canonical envelope and audit log entry. |
+| `CODEC_REVISION` | `'rev-1'` | Revision identifier for the built-in `'jcs-rn-v1'` canonicalizer specification. |
+| `JCS_RN_V1_VECTOR_SET_HASH` | `string` | Pinned 64-character SHA-256 digest of the `'jcs-rn-v1'` (`rev-1`) golden test vector set. |
+| `JCS_RN_V1_TEST_VECTORS` | `CanonicalizerTestVector[]` | Publicly exported golden test vectors covering UTF-16 key sorting, UTC ISO `Date`, tagged `BigInt`, `Map`, `Set`, and `Uint8Array` for cross-runtime verification across Hermes, V8, and JSC. |
+| `computeVectorSetHash(rev, vectors)` | `(codecRevision: string, vectors: readonly CanonicalizerTestVector[]) => string` | Computes the deterministic SHA-256 `vectorSetHash` over a codec revision and its golden test vectors. |
 | `normalizeValue(val)` | `(val: unknown) => unknown` | Recursively normalizes values for RFC 8785 (JCS) and WYSIWYS parity: sorts object keys lexicographically by UTF-16 code units, omits `undefined` properties, converts `Date` to ISO-8601 UTC strings, `BigInt` to `"${val}n"`, `Uint8Array` to `"uint8:<hex>"`, deterministically sorts `Set` and `Map` entries, and rejects `NaN`, `Infinity`, functions, and Symbols with `GuardrailCanonicalizationError`. |
 | `canonicalizeValue(val)` | `(val: unknown) => string` | Serializes any value into a deterministic RFC 8785 (JCS) JSON string. |
-| `canonicalizeEnvelope(params)` | `({ toolName, schemaVersion?, args }) => string` | Returns the deterministic JSON envelope string `{"args":...,"canonicalizerVersion":"jcs-rn-v1","schemaVersion":"1","toolName":"..."}` used for signing and digest verification. |
+| `canonicalizeEnvelope(params)` | `({ toolName, schemaVersion?, args, codecRevision?, vectorSetHash? }) => string` | Returns the deterministic JSON envelope string `{"args":...,"canonicalizerVersion":"jcs-rn-v1","codecRevision":"rev-1","schemaVersion":"1","toolName":"...","vectorSetHash":"..."}` used for signing and digest verification. |
 | `computePayloadHash(envelope)` | `(envelopeString: string) => string` | Synchronous, zero-dependency SHA-256 implementation returning a 64-character lowercase hex digest across React Native (Hermes), Expo Snack Web, and Node/Jest. |
-| `deepFreeze(obj)` | `<T>(obj: T) => Readonly<T>` | Recursively freezes objects, arrays, `Date`, `Map`, `Set`, and TypedArray instances in-place (locking mutator methods) to prevent TOCTOU mutations. |
+| `deepFreeze(obj)` | `<T>(obj: T) => Readonly<T>` | Recursively freezes objects, arrays, `Date`, `Map`, `Set`, and TypedArray instances in-place (locking mutator methods and wrapping TypedArrays in read-only Proxies) to prevent TOCTOU mutations. |
 | `createExecutionSnapshot(val)` | `<T>(val: T) => Readonly<T>` | Creates a detached, deep-frozen execution snapshot of validated arguments so caller-held references cannot mutate execution state. |
 | `reconstructFromSnapshot(snapshot)` | `<T>(snapshot: T) => Readonly<T>` | Reconstructs a clean, deep-frozen execution payload from an approved snapshot immediately before handler execution. |
 | `generateChallengeNonce(byteLength?)` | `(byteLength?: number) => string` | Generates a cryptographically random lowercase hex challenge nonce (`crypto.getRandomValues()`) for transaction-bound approval and replay prevention. |
-| `verifyReceipt(receipt)` | `({ toolName, schemaVersion, canonicalizerVersion, args, payloadHash }) => { valid, reason?, recomputedHash? }` | Verifies a signed receipt against the fail-closed codec registry and SHA-256 envelope digest. |
+| `verifyReceipt(receipt)` | `({ toolName, schemaVersion, canonicalizerVersion, codecRevision?, vectorSetHash?, args, payloadHash }) => { valid, reason?, recomputedHash?, codecRevision?, vectorSetHash? }` | Verifies a signed receipt against the fail-closed codec registry, `codecRevision`, `vectorSetHash`, and SHA-256 envelope digest. |
 | `registerCanonicalizerCodec(codec)` | `(codec: CanonicalizerCodec) => void` | Registers a versioned `CanonicalizerCodec` after running self-verification against its golden `testVectors`. |
 | `getCanonicalizerCodec(version)` | `(version: string) => CanonicalizerCodec` | Retrieves a registered codec by version string or fails closed with `GuardrailUnknownCodecError`. |
 | `verifyAuditChain(logs)` | `(logs: readonly AuditLogEntry[]) => AuditChainVerificationResult` | Recomputes every `entryHash` and `prevHash` link from genesis (`GENESIS_AUDIT_HASH`) and verifies registered `canonicalizerVersion` codecs to detect mutated, deleted, or reordered audit entries. |

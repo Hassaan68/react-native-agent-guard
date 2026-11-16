@@ -1,6 +1,6 @@
 {
   "name": "react-native-agent-guard",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Zero-dependency permission, policy, validation, and human-in-the-loop guardrails for AI agents in React Native.",
   "author": {
     "name": "Muhammad Hassaan",
@@ -43,7 +43,8 @@
   },
   "scripts": {
     "build": "tsup",
-    "lint": "tsc --noEmit --pretty",
+    "format:check": "node scripts/lint.mjs --format-check",
+    "lint": "node scripts/lint.mjs",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",

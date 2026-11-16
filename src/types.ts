@@ -110,6 +110,12 @@ export interface ToolExecutionContext {
   previewError?: string;
   /** Optional threat detections flagged when `threatScanner` ran with `blockOnThreat: false`. */
   threats?: ThreatDetection[];
+  /**
+   * `AbortSignal` triggered when `timeoutMs` elapses.
+   * Pass `{ signal: context.signal }` into `fetch()` or abort-aware async operations for cooperative cancellation.
+   * Note: Synchronous JS or native React Native bridge calls that do not observe `AbortSignal` cannot be preemptively terminated by the JS runtime.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -171,6 +177,8 @@ export interface SerializedQueuedRequest<TInput = unknown> {
   createdAt: number;
   timestamp: number;
   expiresAt?: number;
+  /** Recovery status when hydrated from persistent storage; requires fresh user authorization before execution. */
+  status?: 'pending' | 'pending_reauthorization';
 }
 
 /**
@@ -226,10 +234,15 @@ export interface ToolDefinition<
   inputSchema: TSchema;
   /** Optional schema version string bound into the canonical SHA-256 digest. Defaults to `'1'`. */
   schemaVersion?: string;
-  /** Static policy or dynamic policy function based on parsed input. Defaults to registry's `defaultPolicy` ('auto'). */
+  /** Static policy or dynamic policy function based on parsed input. Defaults to registry's `defaultPolicy` ('confirm'). */
   policy?: PolicyResolver<z.infer<TSchema>>;
-  /** Optional execution timeout in milliseconds. Overrides registry's `defaultTimeoutMs`. */
+  /**
+   * Optional execution timeout in milliseconds. Overrides registry's `defaultTimeoutMs`.
+   * Aborts `context.signal` (`AbortSignal`) on timeout; native bridge calls that do not observe `AbortSignal` have late resolutions ignored.
+   */
   timeoutMs?: number;
+  /** Optional flag allowing `.register(name, def, { overwrite: true })` or `def.overwrite` to replace an existing tool definition. */
+  overwrite?: boolean;
   /** Optional approval expiration TTL in milliseconds when waiting in the confirmation queue. Overrides registry's `approvalTimeoutMs`. */
   approvalTimeoutMs?: number;
   /** Optional per-tool rate limit and loop protection configuration. Overrides global `rateLimit`. */
@@ -472,7 +485,7 @@ export interface AuditStorageAdapter {
  * Configuration options passed to `createToolRegistry(options)`.
  */
 export interface ToolRegistryOptions {
-  /** Fallback policy when a tool does not specify one. Defaults to `'auto'`. */
+  /** Fallback policy when a tool does not specify one. Defaults to `'confirm'` (fail-safe human-in-the-loop). */
   defaultPolicy?: ToolPolicy;
   /** Default execution timeout in milliseconds if not specified per tool. Defaults to `30000` (30s). */
   defaultTimeoutMs?: number;
@@ -480,6 +493,13 @@ export interface ToolRegistryOptions {
   approvalTimeoutMs?: number;
   /** Optional storage adapter for persisting pending approval requests across app restarts/backgrounding. */
   queueStorage?: QueueStorageAdapter;
+  /** When `true`, `syncQueueStorage()` and `hydratePendingQueue()` rethrow storage adapter errors instead of recording them passively. Defaults to `false`. */
+  strictQueuePersistence?: boolean;
+  /** Optional observer callback invoked whenever `queueStorage.loadQueue()` or `queueStorage.saveQueue()` throws an error. */
+  onQueueStorageError?: (
+    error: Error,
+    operation: 'load' | 'save',
+  ) => void | Promise<void>;
   /** Optional time-bound session grant presets offered in `<AgentApprovalSheet />`. */
   sessionGrantOptions?: SessionGrantOption[];
   /** Whether active session grants may bypass `'biometric'` prompts globally. Defaults to `false`. */

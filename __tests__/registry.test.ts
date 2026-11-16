@@ -5,6 +5,7 @@ import {
   AgentApprovalSheet,
   CANONICALIZER_VERSION,
   canonicalizeEnvelope,
+  CODEC_REVISION,
   computePayloadHash,
   createBleSyncToolPreset,
   createCalendarEventToolPreset,
@@ -23,6 +24,7 @@ import {
   GuardrailTimeoutError,
   GuardrailUnknownCodecError,
   JCS_RN_V1_TEST_VECTORS,
+  JCS_RN_V1_VECTOR_SET_HASH,
   normalizeValue,
   reconstructFromSnapshot,
   registerCanonicalizerCodec,
@@ -1447,12 +1449,15 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
       });
 
       expect(CANONICALIZER_VERSION).toBe('jcs-rn-v1');
+      expect(CODEC_REVISION).toBe('rev-1');
       expect(env1).toBe(env2);
       expect(JSON.parse(env1)).toEqual({
         args: norm1,
         canonicalizerVersion: 'jcs-rn-v1',
+        codecRevision: 'rev-1',
         schemaVersion: '3',
         toolName: 'crypto_sign',
+        vectorSetHash: JCS_RN_V1_VECTOR_SET_HASH,
       });
       const hash1 = computePayloadHash(env1);
       const hash2 = computePayloadHash(env2);
@@ -1579,6 +1584,7 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
         canonicalArgs: receivedBioMeta?.canonicalArgs,
         policy: 'biometric',
         nonce: receivedBioMeta?.nonce,
+        signal: expect.any(Object),
         biometricAssertion: 'secure-enclave-jwt-assertion-v1',
       });
       expect(res.biometricAssertion).toBe('secure-enclave-jwt-assertion-v1');
@@ -2135,10 +2141,12 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
   });
 
   describe('21. Fail-Closed Canonicalizer Codec Registry & Golden Test Vectors', () => {
-    it('verifies built-in jcs-rn-v1 golden test vectors and validates live receipts via verifyReceipt()', () => {
+    it('verifies built-in jcs-rn-v1 golden test vectors, codecRevision, vectorSetHash, and validates live receipts via verifyReceipt()', () => {
       expect(JCS_RN_V1_TEST_VECTORS.length).toBeGreaterThanOrEqual(3);
       const codec = getCanonicalizerCodec('jcs-rn-v1');
       expect(codec.version).toBe('jcs-rn-v1');
+      expect(codec.codecRevision).toBe('rev-1');
+      expect(codec.vectorSetHash).toBe(JCS_RN_V1_VECTOR_SET_HASH);
 
       for (const vector of JCS_RN_V1_TEST_VECTORS) {
         const canonical = codec.canonicalizeEnvelope(vector.envelope);
@@ -2149,14 +2157,41 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
           toolName: vector.envelope.toolName,
           schemaVersion: vector.envelope.schemaVersion,
           canonicalizerVersion: 'jcs-rn-v1',
+          codecRevision: 'rev-1',
+          vectorSetHash: JCS_RN_V1_VECTOR_SET_HASH,
           args: vector.envelope.args,
           payloadHash: vector.expectedHash,
         });
         expect(receiptCheck).toEqual({
           valid: true,
           recomputedHash: vector.expectedHash,
+          codecRevision: 'rev-1',
+          vectorSetHash: JCS_RN_V1_VECTOR_SET_HASH,
         });
       }
+
+      // Mismatched codecRevision or vectorSetHash fails verifyReceipt
+      const badRevisionCheck = verifyReceipt({
+        toolName: 'send_payment',
+        schemaVersion: '1',
+        canonicalizerVersion: 'jcs-rn-v1',
+        codecRevision: 'rev-999',
+        args: { alpha: 100, flag: true, zebra: 'last' },
+        payloadHash: JCS_RN_V1_TEST_VECTORS[0]!.expectedHash,
+      });
+      expect(badRevisionCheck.valid).toBe(false);
+      expect(badRevisionCheck.reason).toContain('Codec revision mismatch');
+
+      const badVectorSetCheck = verifyReceipt({
+        toolName: 'send_payment',
+        schemaVersion: '1',
+        canonicalizerVersion: 'jcs-rn-v1',
+        vectorSetHash: 'f'.repeat(64),
+        args: { alpha: 100, flag: true, zebra: 'last' },
+        payloadHash: JCS_RN_V1_TEST_VECTORS[0]!.expectedHash,
+      });
+      expect(badVectorSetCheck.valid).toBe(false);
+      expect(badVectorSetCheck.reason).toContain('Vector-set hash mismatch');
 
       // Mismatched hash fails verifyReceipt
       const badHashCheck = verifyReceipt({
@@ -2255,10 +2290,13 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
         args: { a: 1, b: 2 },
         payloadHash: legacySampleHash,
       });
-      expect(legacyReceiptCheck).toEqual({
-        valid: true,
-        recomputedHash: legacySampleHash,
-      });
+      expect(legacyReceiptCheck).toEqual(
+        expect.objectContaining({
+          valid: true,
+          recomputedHash: legacySampleHash,
+          codecRevision: 'rev-1',
+        }),
+      );
 
       // Prevent overwriting an already-registered version with a different codec object
       expect(() =>
@@ -2353,6 +2391,12 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
       expect(snapshot.nested).not.toBe(rawSource.nested);
       expect(Object.isFrozen(snapshot)).toBe(true);
       expect(Object.isFrozen(snapshot.nested)).toBe(true);
+      expect(() => {
+        (snapshot.bytes as unknown as number[])[0] = 99;
+      }).toThrow(TypeError);
+      expect(() => {
+        Object.setPrototypeOf(snapshot.bytes, null);
+      }).toThrow(TypeError);
 
       const reconstructed = reconstructFromSnapshot(snapshot);
       expect(reconstructed).toEqual(snapshot);
@@ -2431,6 +2475,132 @@ describe('react-native-agent-guard — ToolRegistry & Presets', () => {
           },
         ),
       ).toThrow(GuardrailTimeoutError);
+    });
+
+    it('rejects duplicate tool registrations unless overwrite: true is specified, aborts context.signal on timeout, and surfaces queue persistence errors', async () => {
+      const guardrails = createGuardrails({ defaultPolicy: 'auto' });
+
+      guardrails.register('unique_tool', {
+        description: 'Original tool',
+        inputSchema: z.object({}),
+        policy: 'auto',
+        handler: () => 'v1',
+      });
+
+      // Duplicate registration without overwrite throws
+      expect(() =>
+        guardrails.register('unique_tool', {
+          description: 'Duplicate tool',
+          inputSchema: z.object({}),
+          policy: 'auto',
+          handler: () => 'v2',
+        }),
+      ).toThrow(/already registered/i);
+
+      // Explicit { overwrite: true } succeeds
+      guardrails.register(
+        'unique_tool',
+        {
+          description: 'Replaced tool',
+          inputSchema: z.object({}),
+          policy: 'auto',
+          handler: () => 'v2',
+        },
+        { overwrite: true },
+      );
+      const replacedRes = await guardrails.execute('unique_tool', {});
+      expect(replacedRes.data).toBe('v2');
+
+      // Verify AbortSignal is passed to handler and aborted on timeout
+      let capturedSignal: AbortSignal | undefined;
+      let slowTimer: ReturnType<typeof setTimeout> | undefined;
+      guardrails.register('abortable_tool', {
+        description: 'Observes context.signal on timeout',
+        inputSchema: z.object({}),
+        policy: 'auto',
+        timeoutMs: 30,
+        handler: (_args, ctx) => {
+          capturedSignal = ctx.signal;
+          return new Promise((resolve) => {
+            slowTimer = setTimeout(() => resolve('late'), 2_000);
+          });
+        },
+      });
+
+      const timedOut = await guardrails.execute('abortable_tool', {});
+      if (slowTimer) clearTimeout(slowTimer);
+      expect(timedOut.success).toBe(false);
+      expect(timedOut.code).toBe('TIMEOUT_ERROR');
+      expect(capturedSignal?.aborted).toBe(true);
+
+      // Verify observable queue persistence errors and safe recoverPendingApproval()
+      const onQueueStorageError = jest.fn();
+      let shouldFailStorage = true;
+      const storedItems: SerializedQueuedRequest[] = [
+        {
+          id: 'recoverable_req_1',
+          toolName: 'recoverable_transfer',
+          description: 'Recoverable transfer',
+          input: { amount: 75 },
+          policy: 'confirm',
+          createdAt: Date.now(),
+          timestamp: Date.now(),
+          expiresAt: Date.now() + 60_000,
+        },
+      ];
+
+      const onApprovalRequired = jest.fn(async () => true);
+      const strictGuardrails = createGuardrails({
+        defaultPolicy: 'confirm',
+        strictQueuePersistence: true,
+        onQueueStorageError,
+        onApprovalRequired,
+        queueStorage: {
+          loadQueue: async () => {
+            if (shouldFailStorage) {
+              throw new Error('Disk read error');
+            }
+            return storedItems;
+          },
+          saveQueue: async () => {},
+        },
+      }).register('recoverable_transfer', {
+        description: 'Recoverable transfer',
+        inputSchema: z.object({ amount: z.number() }),
+        policy: 'confirm',
+        handler: ({ amount }) => ({ recoveredAmount: amount }),
+      });
+
+      await expect(strictGuardrails.hydratePendingQueue()).rejects.toThrow(
+        'Disk read error',
+      );
+      expect(strictGuardrails.getQueueStorageError()?.message).toBe(
+        'Disk read error',
+      );
+      expect(onQueueStorageError).toHaveBeenCalledWith(
+        expect.any(Error),
+        'load',
+      );
+
+      // Now allow loadQueue to succeed -> hydrates in 'pending_reauthorization' state without auto-executing
+      shouldFailStorage = false;
+      const hydrated = await strictGuardrails.hydratePendingQueue();
+      expect(hydrated).toHaveLength(1);
+      expect(hydrated[0]?.status).toBe('pending_reauthorization');
+      expect(onApprovalRequired).not.toHaveBeenCalled();
+
+      // Explicitly recover and re-authorize the hydrated request
+      const recoveredRes = await strictGuardrails.recoverPendingApproval<{
+        recoveredAmount: number;
+      }>('recoverable_transfer_missing').catch((e: Error) => e);
+      expect(recoveredRes).toBeInstanceOf(Error);
+
+      const okRecovery = await strictGuardrails.recoverPendingApproval<{
+        recoveredAmount: number;
+      }>('recoverable_req_1');
+      expect(okRecovery.success).toBe(true);
+      expect(okRecovery.data?.recoveredAmount).toBe(75);
+      expect(onApprovalRequired).toHaveBeenCalledTimes(1);
     });
   });
 });

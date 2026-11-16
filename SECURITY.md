@@ -27,10 +27,9 @@ Security patches are released on the latest minor/patch track of `react-native-a
 
 | Version | Supported          |
 | :------ | :----------------- |
-| `0.3.x` | :white_check_mark: |
-| `0.2.x` | :white_check_mark: |
-| `0.1.x` | :white_check_mark: |
-| `< 0.1.0` | :x:              |
+| `0.5.x` | :white_check_mark: |
+| `0.4.x` | :white_check_mark: |
+| `< 0.4.0` | :x:              |
 
 ---
 
@@ -84,7 +83,9 @@ Security patches are released on the latest minor/patch track of `react-native-a
 
 - **Attack Vector**: An agent attempts to silently execute a sensitive hardware or financial operation (e.g., exporting a wallet key, initiating a wire transfer, or unlocking a smart lock via BLE) while the app is running in the foreground or unattended.
 - **How `react-native-agent-guard` Defends**:
-  - **Local Biometric Gating (`policy: 'biometric'`)**: Integrates directly with `expo-local-authentication` (`hasHardwareAsync`, `isEnrolledAsync`, `authenticateAsync`) or custom hardware keystore callbacks (`onBiometricRequired`). The native OS prompts the user via FaceID, TouchID, or Android `BiometricPrompt` before the tool's `handler` is called.
+  1. **Local Biometric Gating (`policy: 'biometric'`)**: Integrates with `expo-local-authentication` (`hasHardwareAsync`, `isEnrolledAsync`, `authenticateAsync`) or custom hardware keystore callbacks (`onBiometricRequired`). The native OS prompts the user via FaceID, TouchID, or Android `BiometricPrompt` before the tool's `handler` is called.
+  2. **Hardware-Backed Cryptographic Attestation (`onBiometricAuth` & `verifyReceipt`)**: Local OS biometric prompts (`expo-local-authentication`) return a client-side boolean and do not by themselves produce a server-verifiable cryptographic signature. For high-assurance backend operations, `react-native-agent-guard` computes a deterministic RFC 8785 (JCS) SHA-256 `payloadHash` over `{ args, canonicalizerVersion: 'jcs-rn-v1', schemaVersion, toolName }` and passes it to `onBiometricAuth`. Host applications are responsible for signing `payloadHash` using hardware-backed keys (iOS Secure Enclave, Android Keystore, or WebAuthn Passkeys), returning `{ verified: true, biometricAssertion }`, and verifying the signed receipt on the backend (e.g., via `verifyReceipt()`).
+  3. **Copy-Based Immutable Execution Snapshots & Replay Prevention**: Validated arguments are deep-cloned via `createExecutionSnapshot()` into detached, deep-frozen snapshots (with `Proxy`-sealed TypedArrays blocking indexed writes like `bytes[0] = 99`), bound to a CSPRNG challenge `nonce` (`crypto.getRandomValues()`), and re-verified via SHA-256 (`consumeAndVerifyApprovalBinding`) immediately prior to `reconstructFromSnapshot()` and handler execution.
 
 ### T4: Malformed JSON, Type Confusion & Hallucinated Arguments
 

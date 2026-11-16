@@ -124,6 +124,7 @@ export class ToolRegistry {
   private readonly activeQueueExpirers = new Map<string, () => void>();
   private readonly consumedApprovalIds = new Set<string>();
   private readonly consumedNonces = new Set<string>();
+  private lastQueueStorageError: Error | null = null;
   private providerApprovalHandler?: ApprovalHandler;
   private providerBiometricHandler?: BiometricHandler;
   private providerQueueStorage?: QueueStorageAdapter;
@@ -282,8 +283,16 @@ export class ToolRegistry {
   }
 
   /**
+   * Return the most recent `QueueStorageAdapter` persistence error, or `null` if healthy.
+   */
+  public getQueueStorageError(): Error | null {
+    return this.lastQueueStorageError;
+  }
+
+  /**
    * Hydrate pending approval requests from the configured `QueueStorageAdapter`,
    * automatically pruning any requests whose `expiresAt` TTL has elapsed while offline/backgrounded.
+   * Hydrated records are marked `'pending_reauthorization'` and never auto-execute without fresh user authorization.
    */
   public async hydratePendingQueue(): Promise<SerializedQueuedRequest[]> {
     const adapter = this.providerQueueStorage ?? this.options.queueStorage;
@@ -291,16 +300,64 @@ export class ToolRegistry {
       return this.pruneExpiredRequests();
     }
 
-    const loaded = await adapter.loadQueue();
+    let loaded: SerializedQueuedRequest[] = [];
+    try {
+      loaded = await adapter.loadQueue();
+      this.lastQueueStorageError = null;
+    } catch (err) {
+      const storageErr =
+        err instanceof Error ? err : new Error(String(err ?? 'Queue load failed'));
+      this.lastQueueStorageError = storageErr;
+      try {
+        await this.options.onQueueStorageError?.(storageErr, 'load');
+      } catch {
+        // Ignore observer callback errors
+      }
+      if (this.options.strictQueuePersistence) {
+        throw storageErr;
+      }
+      return this.getPendingQueue();
+    }
+
     const now = Date.now();
 
     for (const item of loaded) {
       if (item.expiresAt === undefined || now < item.expiresAt) {
-        this.persistedQueue.set(item.id, item);
+        this.persistedQueue.set(item.id, {
+          ...item,
+          status: 'pending_reauthorization',
+        });
       }
     }
 
     return this.pruneExpiredRequests();
+  }
+
+  /**
+   * Safely recover and re-submit a hydrated pending approval request through the full
+   * validation, fresh user authorization / biometric gate, and execution lifecycle.
+   */
+  public async recoverPendingApproval<TOutput = unknown>(
+    requestId: string,
+  ): Promise<ToolExecutionResult<TOutput>> {
+    const item = this.persistedQueue.get(requestId);
+    if (!item) {
+      throw new Error(
+        `Pending approval request "${requestId}" was not found in the queue.`,
+      );
+    }
+
+    if (item.expiresAt !== undefined && Date.now() >= item.expiresAt) {
+      this.persistedQueue.delete(requestId);
+      await this.syncQueueStorage();
+      throw new GuardrailTimeoutError(
+        `Pending approval request "${requestId}" expired before recovery.`,
+      );
+    }
+
+    this.persistedQueue.delete(requestId);
+    await this.syncQueueStorage();
+    return this.execute<TOutput>(item.toolName, item.input);
   }
 
   /**
@@ -356,8 +413,19 @@ export class ToolRegistry {
     }
     try {
       await adapter.saveQueue(Array.from(this.persistedQueue.values()));
-    } catch {
-      // Never allow queue storage errors to interrupt execution
+      this.lastQueueStorageError = null;
+    } catch (err) {
+      const storageErr =
+        err instanceof Error ? err : new Error(String(err ?? 'Queue save failed'));
+      this.lastQueueStorageError = storageErr;
+      try {
+        await this.options.onQueueStorageError?.(storageErr, 'save');
+      } catch {
+        // Ignore observer callback errors
+      }
+      if (this.options.strictQueuePersistence) {
+        throw storageErr;
+      }
     }
   }
 
@@ -388,13 +456,24 @@ export class ToolRegistry {
 
   /**
    * Register a tool with a Zod input schema, execution policy, optional timeout, and handler.
+   * Throws an error if a tool with the same name is already registered unless `{ overwrite: true }` is passed.
    */
   public register<TSchema extends z.ZodType, TOutput = unknown>(
     name: string,
     definition: ToolDefinition<TSchema, TOutput>,
+    options?: { overwrite?: boolean },
   ): this {
     if (!name || typeof name !== 'string') {
       throw new Error('Tool name must be a non-empty string.');
+    }
+    if (
+      this.tools.has(name) &&
+      !options?.overwrite &&
+      !definition.overwrite
+    ) {
+      throw new Error(
+        `Tool "${name}" is already registered. Pass { overwrite: true } to replace an existing tool definition.`,
+      );
     }
     this.tools.set(
       name,
@@ -1056,6 +1135,8 @@ export class ToolRegistry {
       ? redactPIIValue(reconstructedInput, this.options.redactPII)
       : reconstructedInput;
 
+    const abortController = new AbortController();
+
     const executionContext: ToolExecutionContext = {
       toolName,
       schemaVersion: currentSchemaVersion,
@@ -1063,6 +1144,7 @@ export class ToolRegistry {
       canonicalArgs,
       policy: resolvedPolicy,
       nonce: executionNonce,
+      signal: abortController.signal,
       ...(biometricAssertion !== undefined ? { biometricAssertion } : {}),
       ...(sessionGrantUsed ? { sessionGrantUsed: true } : {}),
       ...(previewResult !== undefined ? { previewResult } : {}),
@@ -1083,7 +1165,10 @@ export class ToolRegistry {
           ? await Promise.race([
               executionPromise,
               new Promise<typeof timeoutSymbol>((resolve) => {
-                timeoutId = setTimeout(() => resolve(timeoutSymbol), timeoutMs);
+                timeoutId = setTimeout(() => {
+                  abortController.abort();
+                  resolve(timeoutSymbol);
+                }, timeoutMs);
               }),
             ])
           : await executionPromise;

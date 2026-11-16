@@ -6,6 +6,19 @@
 export const CANONICALIZER_VERSION = 'jcs-rn-v1';
 
 /**
+ * Revision identifier for the built-in `'jcs-rn-v1'` canonicalizer specification.
+ */
+export const CODEC_REVISION = 'rev-1';
+
+/**
+ * Pinned SHA-256 digest of the `'jcs-rn-v1'` (`rev-1`) golden test vector set.
+ * Bound into every canonical receipt envelope (`vectorSetHash`) so any cross-engine
+ * (Hermes / V8 / JSC) or version drift in serialization rules is cryptographically detectable.
+ */
+export const JCS_RN_V1_VECTOR_SET_HASH =
+  'c5218c0d77a435b4eb500919973f7c695398c69910f938bd1953b28a7310b43f';
+
+/**
  * Error thrown when tool arguments contain non-canonicalizable values
  * such as Functions, Symbols, non-finite numbers (NaN/Infinity), circular references, or invalid Dates.
  */
@@ -89,12 +102,16 @@ export interface CanonicalizerTestVector {
  */
 export interface CanonicalizerCodec {
   version: string;
+  codecRevision?: string;
+  vectorSetHash?: string;
   normalizeValue: (val: unknown) => unknown;
   canonicalizeEnvelope: (input: {
     toolName: string;
     schemaVersion?: string;
     args: unknown;
     canonicalizerVersion?: string;
+    codecRevision?: string;
+    vectorSetHash?: string;
   }) => string;
   testVectors: CanonicalizerTestVector[];
 }
@@ -280,20 +297,24 @@ export interface CanonicalEnvelopeParams {
   schemaVersion?: string;
   args: unknown;
   canonicalizerVersion?: string;
+  codecRevision?: string;
+  vectorSetHash?: string;
 }
 
 /**
  * Produce a deterministic RFC 8785 (JCS) JSON envelope string binding
- * `{ args, canonicalizerVersion, schemaVersion, toolName }` for WYSIWYS approval
- * and hardware biometric attestation.
+ * `{ args, canonicalizerVersion, codecRevision, schemaVersion, toolName, vectorSetHash }`
+ * for WYSIWYS approval and hardware biometric attestation.
  */
 export function canonicalizeEnvelope(params: CanonicalEnvelopeParams): string {
   const normalizedArgs = normalizeValue(params.args);
   const envelope = {
     args: normalizedArgs === undefined ? null : normalizedArgs,
     canonicalizerVersion: params.canonicalizerVersion ?? CANONICALIZER_VERSION,
+    codecRevision: params.codecRevision ?? CODEC_REVISION,
     schemaVersion: params.schemaVersion ?? '1',
     toolName: params.toolName,
+    vectorSetHash: params.vectorSetHash ?? JCS_RN_V1_VECTOR_SET_HASH,
   };
   return JSON.stringify(envelope);
 }
@@ -485,6 +506,50 @@ function lockMutatorMethods(
   }
 }
 
+function wrapReadonlyTypedArray<T extends object>(view: T): T {
+  lockMutatorMethods(
+    view,
+    ['set', 'fill', 'copyWithin', 'reverse', 'sort'],
+    'TypedArray',
+  );
+  try {
+    Object.freeze(view);
+  } catch {
+    // V8 disallows Object.freeze on non-empty TypedArray views; Proxy enforces element immutability
+  }
+
+  return new Proxy(view, {
+    get(target, prop) {
+      if (
+        prop === 'constructor' ||
+        prop === 'set' ||
+        prop === 'fill' ||
+        prop === 'copyWithin' ||
+        prop === 'reverse' ||
+        prop === 'sort'
+      ) {
+        return Reflect.get(target, prop, target);
+      }
+      const value = Reflect.get(target, prop, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+    set() {
+      throw new TypeError('Cannot mutate a deep-frozen TypedArray instance.');
+    },
+    defineProperty() {
+      throw new TypeError('Cannot mutate a deep-frozen TypedArray instance.');
+    },
+    deleteProperty() {
+      throw new TypeError('Cannot mutate a deep-frozen TypedArray instance.');
+    },
+    setPrototypeOf() {
+      throw new TypeError(
+        'Cannot mutate prototype of a deep-frozen TypedArray instance.',
+      );
+    },
+  });
+}
+
 function deepFreezeInternal<T>(obj: T, seen: WeakSet<object>): Readonly<T> {
   if (obj === null || typeof obj !== 'object') {
     return obj;
@@ -518,29 +583,26 @@ function deepFreezeInternal<T>(obj: T, seen: WeakSet<object>): Readonly<T> {
     return Object.freeze(obj);
   }
 
-  if (ArrayBuffer.isView(target)) {
-    lockMutatorMethods(
-      target,
-      ['set', 'fill', 'copyWithin', 'reverse', 'sort'],
-      'TypedArray',
-    );
-    try {
-      Object.freeze(target);
-    } catch {
-      // V8 disallows Object.freeze on non-empty TypedArray views; mutator methods are locked
-    }
-    return obj;
+  if (ArrayBuffer.isView(target) || target instanceof Uint8Array) {
+    return wrapReadonlyTypedArray(target) as unknown as Readonly<T>;
   }
-
-  Object.freeze(target);
 
   const propNames = Object.getOwnPropertyNames(target);
   for (const name of propNames) {
     const descriptor = Object.getOwnPropertyDescriptor(target, name);
     if (descriptor && 'value' in descriptor) {
-      deepFreezeInternal(descriptor.value, seen);
+      const frozenChild = deepFreezeInternal(descriptor.value, seen);
+      if (frozenChild !== descriptor.value && descriptor.writable) {
+        try {
+          (target as Record<string, unknown>)[name] = frozenChild;
+        } catch {
+          // Ignore if non-writable
+        }
+      }
     }
   }
+
+  Object.freeze(target);
 
   return obj;
 }
@@ -619,7 +681,11 @@ function cloneForSnapshot<T>(val: T, seen: WeakSet<object>): T {
     }
 
     if (obj instanceof Uint8Array) {
-      return new Uint8Array(obj) as unknown as T;
+      const copy = new Uint8Array(obj.length);
+      for (let i = 0; i < obj.length; i += 1) {
+        copy[i] = obj[i] ?? 0;
+      }
+      return wrapReadonlyTypedArray(copy) as unknown as T;
     }
 
     if (seen.has(obj)) {
@@ -690,7 +756,9 @@ export function reconstructFromSnapshot<T>(snapshot: T): Readonly<T> {
 }
 
 /**
- * Built-in golden test vectors for the `'jcs-rn-v1'` canonicalizer codec.
+ * Built-in golden test vectors for the `'jcs-rn-v1'` (`rev-1`) canonicalizer codec.
+ * Covers UTF-16 key sorting, UTC ISO `Date`, tagged `BigInt`, `Map`, `Set`, and `Uint8Array`
+ * so cross-engine determinism can be verified across Hermes, V8, and JavaScriptCore.
  */
 export const JCS_RN_V1_TEST_VECTORS: CanonicalizerTestVector[] = [
   {
@@ -706,9 +774,9 @@ export const JCS_RN_V1_TEST_VECTORS: CanonicalizerTestVector[] = [
       },
     },
     expectedCanonical:
-      '{"args":{"alpha":100,"flag":true,"zebra":"last"},"canonicalizerVersion":"jcs-rn-v1","schemaVersion":"1","toolName":"send_payment"}',
+      '{"args":{"alpha":100,"flag":true,"zebra":"last"},"canonicalizerVersion":"jcs-rn-v1","codecRevision":"rev-1","schemaVersion":"1","toolName":"send_payment","vectorSetHash":"c5218c0d77a435b4eb500919973f7c695398c69910f938bd1953b28a7310b43f"}',
     expectedHash:
-      'd52812ab97736cfb1c35524ffe8fbc07f9684508992bb5772f64c258b1cb26e9',
+      '36280152b0d21b0437f2cb03b72c7b7fe07def7ac796fbc58f9ce82456ad26a6',
   },
   {
     name: 'date_utc_iso_and_bigint_tagged',
@@ -721,9 +789,9 @@ export const JCS_RN_V1_TEST_VECTORS: CanonicalizerTestVector[] = [
       },
     },
     expectedCanonical:
-      '{"args":{"amountWei":"5000000000000000000n","deadline":"2026-01-15T08:30:00.000Z"},"canonicalizerVersion":"jcs-rn-v1","schemaVersion":"2.0","toolName":"sign_tx"}',
+      '{"args":{"amountWei":"5000000000000000000n","deadline":"2026-01-15T08:30:00.000Z"},"canonicalizerVersion":"jcs-rn-v1","codecRevision":"rev-1","schemaVersion":"2.0","toolName":"sign_tx","vectorSetHash":"c5218c0d77a435b4eb500919973f7c695398c69910f938bd1953b28a7310b43f"}',
     expectedHash:
-      '836f74cbc8d98c322e0a111f7435bddcff742b0f047b2c8d325d899eb0b3f708',
+      '3901eceec7560540ee0a42341723941a1ff7f89c4a34ee0bd2071b453b2d1b6f',
   },
   {
     name: 'map_set_and_uint8array',
@@ -740,11 +808,31 @@ export const JCS_RN_V1_TEST_VECTORS: CanonicalizerTestVector[] = [
       },
     },
     expectedCanonical:
-      '{"args":{"meta":[["a",2],["z",1]],"payload":"uint8:deadbeef","scopes":["read","write"]},"canonicalizerVersion":"jcs-rn-v1","schemaVersion":"1","toolName":"sync_ble"}',
+      '{"args":{"meta":[["a",2],["z",1]],"payload":"uint8:deadbeef","scopes":["read","write"]},"canonicalizerVersion":"jcs-rn-v1","codecRevision":"rev-1","schemaVersion":"1","toolName":"sync_ble","vectorSetHash":"c5218c0d77a435b4eb500919973f7c695398c69910f938bd1953b28a7310b43f"}',
     expectedHash:
-      'f62a95482dc23398b0f5b68618b803c86db92f4613e44f782b830b16f167e4f3',
+      '92eeb27fb11e03fde317885f3de54b50af6fe550eb59b0d1c2e64acaa2c02300',
   },
 ];
+
+/**
+ * Compute the deterministic SHA-256 `vectorSetHash` over a codec's `codecRevision` and golden `testVectors`.
+ */
+export function computeVectorSetHash(
+  codecRevision: string,
+  vectors: readonly CanonicalizerTestVector[],
+  normalizer: (val: unknown) => unknown = normalizeValue,
+): string {
+  const payload = {
+    codecRevision,
+    vectors: vectors.map((v) => ({
+      args: normalizer(v.envelope.args),
+      name: v.name,
+      schemaVersion: v.envelope.schemaVersion,
+      toolName: v.envelope.toolName,
+    })),
+  };
+  return computePayloadHash(JSON.stringify(payload));
+}
 
 const codecRegistry = new Map<string, CanonicalizerCodec>();
 
@@ -766,6 +854,19 @@ export function registerCanonicalizerCodec(codec: CanonicalizerCodec): void {
     }
     throw new GuardrailCanonicalizationError(
       `Canonicalizer codec version "${codec.version}" is already registered and cannot be overwritten.`,
+    );
+  }
+
+  const revision = codec.codecRevision ?? CODEC_REVISION;
+  const computedSetHash = computeVectorSetHash(
+    revision,
+    codec.testVectors,
+    codec.normalizeValue,
+  );
+
+  if (codec.vectorSetHash && codec.vectorSetHash !== computedSetHash) {
+    throw new GuardrailCanonicalizationError(
+      `Codec vectorSetHash mismatch for "${codec.version}": expected "${computedSetHash}", got "${codec.vectorSetHash}"`,
     );
   }
 
@@ -794,7 +895,11 @@ export function registerCanonicalizerCodec(codec: CanonicalizerCodec): void {
     }
   }
 
-  codecRegistry.set(codec.version, codec);
+  codecRegistry.set(codec.version, {
+    ...codec,
+    codecRevision: revision,
+    vectorSetHash: codec.vectorSetHash ?? computedSetHash,
+  });
 }
 
 /**
@@ -810,16 +915,26 @@ export function getCanonicalizerCodec(version: string): CanonicalizerCodec {
 }
 
 /**
- * Verify a signed execution or audit receipt against its declared `canonicalizerVersion` and `payloadHash`.
- * Fails closed if `canonicalizerVersion` is unknown or if the recomputed SHA-256 digest does not match `payloadHash`.
+ * Verify a signed execution or audit receipt against its declared `canonicalizerVersion`,
+ * `codecRevision`, `vectorSetHash`, and `payloadHash`.
+ * Fails closed if `canonicalizerVersion` is unknown, if `codecRevision` or `vectorSetHash` drifted,
+ * or if the recomputed SHA-256 digest does not match `payloadHash`.
  */
 export function verifyReceipt(receipt: {
   toolName: string;
   schemaVersion: string;
   canonicalizerVersion: string;
+  codecRevision?: string;
+  vectorSetHash?: string;
   args: unknown;
   payloadHash: string;
-}): { valid: boolean; reason?: string; recomputedHash?: string } {
+}): {
+  valid: boolean;
+  reason?: string;
+  recomputedHash?: string;
+  codecRevision?: string;
+  vectorSetHash?: string;
+} {
   let codec: CanonicalizerCodec;
   try {
     codec = getCanonicalizerCodec(receipt.canonicalizerVersion);
@@ -830,12 +945,40 @@ export function verifyReceipt(receipt: {
     };
   }
 
+  if (
+    receipt.codecRevision !== undefined &&
+    codec.codecRevision !== undefined &&
+    receipt.codecRevision !== codec.codecRevision
+  ) {
+    return {
+      valid: false,
+      reason: `Codec revision mismatch: expected "${codec.codecRevision}", received "${receipt.codecRevision}".`,
+      codecRevision: codec.codecRevision,
+      vectorSetHash: codec.vectorSetHash,
+    };
+  }
+
+  if (
+    receipt.vectorSetHash !== undefined &&
+    codec.vectorSetHash !== undefined &&
+    receipt.vectorSetHash !== codec.vectorSetHash
+  ) {
+    return {
+      valid: false,
+      reason: `Vector-set hash mismatch: expected "${codec.vectorSetHash}", received "${receipt.vectorSetHash}".`,
+      codecRevision: codec.codecRevision,
+      vectorSetHash: codec.vectorSetHash,
+    };
+  }
+
   try {
     const canonicalEnvelope = codec.canonicalizeEnvelope({
       toolName: receipt.toolName,
       schemaVersion: receipt.schemaVersion,
       args: receipt.args,
       canonicalizerVersion: receipt.canonicalizerVersion,
+      codecRevision: receipt.codecRevision ?? codec.codecRevision,
+      vectorSetHash: receipt.vectorSetHash ?? codec.vectorSetHash,
     });
     const recomputedHash = computePayloadHash(canonicalEnvelope);
     if (recomputedHash !== receipt.payloadHash) {
@@ -843,9 +986,16 @@ export function verifyReceipt(receipt: {
         valid: false,
         reason: `Payload hash mismatch: expected "${recomputedHash}", received "${receipt.payloadHash}".`,
         recomputedHash,
+        codecRevision: codec.codecRevision,
+        vectorSetHash: codec.vectorSetHash,
       };
     }
-    return { valid: true, recomputedHash };
+    return {
+      valid: true,
+      recomputedHash,
+      codecRevision: codec.codecRevision,
+      vectorSetHash: codec.vectorSetHash,
+    };
   } catch (err) {
     return {
       valid: false,
@@ -860,6 +1010,8 @@ export function verifyReceipt(receipt: {
 // Pre-populate the built-in 'jcs-rn-v1' codec and run golden vector self-tests at initialization
 registerCanonicalizerCodec({
   version: CANONICALIZER_VERSION,
+  codecRevision: CODEC_REVISION,
+  vectorSetHash: JCS_RN_V1_VECTOR_SET_HASH,
   normalizeValue,
   canonicalizeEnvelope,
   testVectors: JCS_RN_V1_TEST_VECTORS,

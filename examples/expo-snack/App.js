@@ -7,18 +7,21 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+
 import { z } from 'zod';
 import {
   createGuardrails,
   AgentApprovalProvider,
   AgentApprovalSheet,
   CANONICALIZER_VERSION,
+  CODEC_REVISION,
   computePayloadHash,
   GuardrailThreatError,
   verifyReceipt,
   verifyAuditChain,
   getCanonicalizerCodec,
   JCS_RN_V1_TEST_VECTORS,
+  JCS_RN_V1_VECTOR_SET_HASH,
 } from 'react-native-agent-guard';
 
 /**
@@ -69,7 +72,7 @@ async function handleBiometricAttestation(
 }
 
 // ---------------------------------------------------------------------------
-// 1. Configure GuardrailRegistry with v0.4.5 Capabilities
+// 1. Configure GuardrailRegistry with v0.4.6 Capabilities
 // ---------------------------------------------------------------------------
 const guardrails = createGuardrails({
   defaultPolicy: 'confirm',
@@ -148,6 +151,8 @@ const guardrails = createGuardrails({
         toolName: context.toolName,
         schemaVersion: context.schemaVersion,
         canonicalizerVersion: CANONICALIZER_VERSION,
+        codecRevision: CODEC_REVISION,
+        vectorSetHash: JCS_RN_V1_VECTOR_SET_HASH,
         args,
         payloadHash: context.payloadHash,
       });
@@ -157,6 +162,8 @@ const guardrails = createGuardrails({
         beneficiary: args.beneficiary,
         amountUSD: args.amountUSD,
         payloadHash: context.payloadHash,
+        codecRevision: receiptVerification.codecRevision,
+        vectorSetHash: receiptVerification.vectorSetHash,
         nonce: context.nonce,
         biometricAssertion: context.biometricAssertion,
         receiptValid: receiptVerification.valid,
@@ -204,6 +211,10 @@ const guardrails = createGuardrails({
 
       return {
         codecVersion: codec.version,
+        codecRevision: codec.codecRevision,
+        vectorSetHashPrefix: codec.vectorSetHash
+          ? `${codec.vectorSetHash.slice(0, 16)}...`
+          : 'n/a',
         totalVectors: vectorResults.length,
         allVectorsPassed: vectorResults.every((v) => v.passed),
         vectors: vectorResults,
@@ -215,7 +226,7 @@ export default function App() {
   const [auditEntries, setAuditEntries] = useState([]);
   const [activeGrants, setActiveGrants] = useState([]);
   const [statusBanner, setStatusBanner] = useState(
-    'Tap any scenario below to test v0.4.5 guardrails.',
+    'Tap any scenario below to test v0.4.6 guardrails.',
   );
   const [lastReceiptBox, setLastReceiptBox] = useState(null);
   const [codecReportBox, setCodecReportBox] = useState(null);
@@ -279,6 +290,10 @@ export default function App() {
       setLastReceiptBox({
         wireId: res.data.wireId,
         canonicalizerVersion: CANONICALIZER_VERSION,
+        codecRevision: res.data.codecRevision,
+        vectorSetHash: res.data.vectorSetHash
+          ? `${res.data.vectorSetHash.slice(0, 16)}...`
+          : '',
         payloadHash: res.data.payloadHash,
         biometricAssertion: res.data.biometricAssertion,
         receiptVerified: res.data.receiptValid,
@@ -353,7 +368,7 @@ export default function App() {
     if (res.success && res.data) {
       setCodecReportBox(res.data);
       setStatusBanner(
-        `🧪 Codec "${res.data.codecVersion}" Golden Self-Test: ${res.data.totalVectors}/${res.data.totalVectors} Vectors Passed!`,
+        `🧪 Codec "${res.data.codecVersion}" (${res.data.codecRevision}) Self-Test: ${res.data.totalVectors}/${res.data.totalVectors} Vectors Passed!`,
       );
     }
   };
@@ -382,7 +397,7 @@ export default function App() {
             <View style={styles.badgeRow}>
               <View style={styles.versionBadge}>
                 <Text style={styles.versionBadgeText}>
-                  react-native-agent-guard v0.4.5
+                  react-native-agent-guard v0.4.6
                 </Text>
               </View>
               <View style={styles.codecBadge}>
