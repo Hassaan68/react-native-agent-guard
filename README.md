@@ -33,7 +33,8 @@ However, wiring raw LLM tool calls directly into React Native APIs introduces cr
 - **Static & Dynamic Execution Policies**: Configure `'auto' | 'confirm' | 'biometric' | 'deny'` statically or compute policies dynamically per invocation (`(parsedInput) => 'auto' | 'confirm' | 'biometric' | 'deny'`).
 - **Self-Correcting Zod Validation**: Safely parses stringified JSON and runs `inputSchema.safeParseAsync()`, returning structured `VALIDATION_ERROR` responses with actionable `llmFeedback` strings so agents can self-correct without throwing unhandled exceptions.
 - **Headless FIFO Queue & Ready-Made UI**: Use `<AgentApprovalProvider>` + `<AgentApprovalSheet />` out of the box, or build custom approval modals with the `useAgentApproval()` hook.
-- **Pluggable Biometrics**: Connect `expo-local-authentication` or `react-native-biometrics` via `onBiometricRequired`.
+- **Pluggable Biometrics & Hardware Attestation (`v0.4.0`)**: Connect `expo-local-authentication`, `react-native-biometrics`, or iOS Secure Enclave / Android Keystore / Passkeys via `onBiometricRequired` or `onBiometricAuth`, binding a deterministic SHA-256 `payloadHash` directly into `handler(args, { biometricAssertion, payloadHash })`.
+- **TOCTOU Deep-Freeze & WYSIWYS Integrity (`v0.4.0`)**: Automatically deep-freezes validated arguments (`deepFreeze`), canonicalizes non-JSON types (`Date`, `BigInt`, `Map`, `Set`, `Uint8Array`) per RFC 8785 (JCS) for `<AgentApprovalSheet />` What-You-See-Is-What-You-Sign parity, and re-verifies the SHA-256 digest immediately before handler execution (`GuardrailTamperError`).
 - **Universal Schema Exporters**: Export registered tools directly to `.toOpenAITools()`, `.toClaudeTools()`, and `.toMCPTools()` using Zod v4's `z.toJSONSchema(schema, { target: 'draft-07' })`.
 - **Audit Logging**: Built-in in-memory and persistent `AuditStorageAdapter` (compatible with `AsyncStorage` and `react-native-mmkv`) tracking `durationMs`, policy resolution, and execution status.
 - **Built-In Mobile Presets**: Ready-to-use tool factories for payments (`createPaymentToolPreset`), BLE synchronization (`createBleSyncToolPreset`), and calendar events (`createCalendarEventToolPreset`).
@@ -135,6 +136,79 @@ When a tool's policy resolves to `'biometric'`, `react-native-agent-guard` autom
      ```
 
    > **Using `react-native-biometrics` instead**: If your bare React Native project uses `react-native-biometrics` or a custom hardware keychain, pass an `onBiometricRequired` callback to `createGuardrails({ onBiometricRequired: async (req) => { ... } })`.
+
+---
+
+## Hardware-Backed Biometric Attestation & TOCTOU Protection (v0.4.0)
+
+In high-assurance fintech, wallet, enterprise, and healthcare apps, a boolean result from a client-side biometric prompt is not sufficient on its own—your backend needs cryptographic proof of **which exact tool, schema version, and arguments** the user approved on their device, and the client runtime must prevent Time-of-Check to Time-of-Use (TOCTOU) argument mutation while a request waits in the approval queue.
+
+### How the v0.4.0 Integrity Pipeline Works
+
+1. **Immediate TOCTOU Deep-Freeze (`deepFreeze`)**: As soon as `inputSchema.safeParseAsync()` succeeds (including any Zod `.default()` and `.transform()` steps), `react-native-agent-guard` recursively freezes `parsedArgs` in-place—locking plain objects, arrays, `Date`, `Map`, `Set`, and TypedArray mutator methods so concurrent code cannot mutate queued arguments while awaiting user confirmation or biometrics.
+2. **RFC 8785 (JCS) Deterministic Canonicalization & WYSIWYS Parity (`normalizeValue` & `canonicalizeEnvelope`)**: Arguments are normalized into a deterministic JSON envelope (`{ args, schemaVersion, toolName }`) with UTF-16 lexicographically sorted keys and safe serialization of `Date` (ISO-8601 UTC), `BigInt` (`"1000n"`), `Uint8Array` (`"uint8:<hex>"`), `Set`, and `Map`. `<AgentApprovalSheet />` renders `request.canonicalArgs` so What-You-See-Is-What-You-Sign (WYSIWYS) matches the exact bytes hashed.
+3. **Cryptographic Biometric Attestation (`onBiometricAuth`)**: A zero-dependency, synchronous SHA-256 digest (`payloadHash`) of the canonical envelope is passed to `onBiometricAuth` so you can sign the digest using iOS Secure Enclave, Android Keystore, or WebAuthn/Passkeys and return `{ verified: true, biometricAssertion }`.
+4. **Pre-Handler SHA-256 Re-Verification (`GuardrailTamperError`)**: Immediately before invoking `tool.handler(args, context)`, the registry recomputes the SHA-256 digest of the envelope. If any argument or `schemaVersion` drifted between approval and execution, execution is aborted with `GuardrailTamperError` and recorded as `TAMPER_DETECTED` in the audit log.
+
+### End-to-End Hardware Attestation Example
+
+```ts
+import { z } from 'zod';
+import { createGuardrails } from 'react-native-agent-guard';
+
+export const guardrails = createGuardrails({
+  defaultPolicy: 'biometric',
+  // Sign the deterministic SHA-256 payloadHash with Secure Enclave / Keystore / Passkeys
+  onBiometricAuth: async (
+    toolName,
+    args,
+    { payloadHash, canonicalArgs, schemaVersion },
+  ) => {
+    // Example: Sign `payloadHash` using a hardware-backed private key gated by FaceID / TouchID
+    const signedToken = await signDigestWithSecureEnclave({
+      challengeDigestHex: payloadHash,
+      promptMessage: `Authorize ${toolName} (schema v${schemaVersion})`,
+    });
+
+    if (!signedToken) {
+      return { verified: false };
+    }
+
+    return {
+      verified: true,
+      biometricAssertion: signedToken,
+    };
+  },
+}).register('authorize_wire_transfer', {
+  description: 'Execute an attested high-value wire transfer',
+  schemaVersion: '1.0',
+  inputSchema: z.object({
+    recipientIban: z.string().transform((s) => s.replace(/\s+/g, '').toUpperCase()),
+    amountMinorUnits: z.bigint(),
+    executionDate: z.instanceof(Date),
+  }),
+  policy: 'biometric',
+  handler: async (args, { biometricAssertion, payloadHash, schemaVersion }) => {
+    // Forward validated arguments + hardware-signed attestation proof to your backend
+    const response = await fetch('https://api.your-bank.com/v1/wires', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Biometric-Assertion': String(biometricAssertion ?? ''),
+        'X-Payload-SHA256': payloadHash,
+        'X-Schema-Version': schemaVersion,
+      },
+      body: JSON.stringify({
+        recipientIban: args.recipientIban,
+        amountMinorUnits: args.amountMinorUnits.toString(),
+        executionDate: args.executionDate.toISOString(),
+      }),
+    });
+
+    return response.json();
+  },
+});
+```
 
 ---
 
@@ -706,6 +780,21 @@ const unsubscribe = guardrails.onAudit((event) => {
 // Inspect in-memory execution history at any time
 const history = guardrails.getAuditLog();
 ```
+
+---
+
+## API Reference: Canonicalization, Digest & TOCTOU Utilities (v0.4.0)
+
+In addition to `createGuardrails`, `createToolRegistry`, `<AgentApprovalProvider>`, `<AgentApprovalSheet />`, `toVercelAITools`, and `toLangChainTools`, `react-native-agent-guard` exports its deterministic canonicalization and tamper-protection primitives for direct use in custom UIs or backend verification:
+
+| Export | Signature / Type | Description |
+| :--- | :--- | :--- |
+| `normalizeValue(val)` | `(val: unknown) => unknown` | Recursively normalizes values for RFC 8785 (JCS) and WYSIWYS parity: sorts object keys lexicographically by UTF-16 code units, omits `undefined` properties, converts `Date` to ISO-8601 UTC strings, `BigInt` to `"${val}n"`, `Uint8Array` to `"uint8:<hex>"`, deterministically sorts `Set` and `Map` entries, and rejects functions/Symbols with `GuardrailCanonicalizationError`. |
+| `canonicalizeEnvelope(params)` | `({ toolName, schemaVersion?, args }) => string` | Returns the deterministic JSON envelope string `{"args":...,"schemaVersion":"1","toolName":"..."}` used for signing and digest verification. |
+| `computePayloadHash(envelope)` | `(envelopeString: string) => string` | Synchronous, zero-dependency SHA-256 implementation returning a 64-character lowercase hex digest across React Native (Hermes), Expo Snack Web, and Node/Jest. |
+| `deepFreeze(obj)` | `<T>(obj: T) => Readonly<T>` | Recursively freezes objects, arrays, `Date`, `Map`, `Set`, and TypedArray instances in-place (locking mutator methods) to prevent TOCTOU mutations. |
+| `GuardrailTamperError` | `class extends Error` | Thrown before handler execution when pre-handler SHA-256 digest re-verification detects argument or `schemaVersion` drift (`code: 'TAMPER_DETECTED'`). |
+| `GuardrailCanonicalizationError` | `class extends Error` | Thrown by `normalizeValue` when an argument contains non-canonicalizable values such as functions, Symbols, circular references, or invalid `Date` instances (`code: 'CANONICALIZATION_ERROR'`). |
 
 ---
 
