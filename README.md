@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/Hassaan68/react-native-agent-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/Hassaan68/react-native-agent-guard/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/react-native-agent-guard.svg?style=flat-square)](https://www.npmjs.com/package/react-native-agent-guard)
+[![npm downloads](https://img.shields.io/npm/dw/react-native-agent-guard?style=flat-square)](https://www.npmjs.com/package/react-native-agent-guard)
 [![Try it on Expo Snack](https://img.shields.io/badge/Expo_Snack-Try_Live_Demo-000020?style=flat-square&logo=expo&logoColor=white)](https://snack.expo.dev/@hassaan68/react-native-agent-guard-demo)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](./LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178C6.svg?style=flat-square&logo=typescript&logoColor=white)](./tsconfig.json)
